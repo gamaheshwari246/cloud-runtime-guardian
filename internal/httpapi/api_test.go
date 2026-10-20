@@ -183,3 +183,55 @@ func TestSeparatedCredentialsAndNoAnonymousFallback(t *testing.T) {
 		t.Fatalf("missing admin role became anonymous: %d", w.Code)
 	}
 }
+
+func TestCursorPaginationHTTP(t *testing.T) {
+	h := testAPI(t, "")
+	shell, conn := apiEvents()
+	for i := 0; i < 4; i++ {
+		sh := shell
+		co := conn
+		sh.ID = fmt.Sprintf("sh-%d", i)
+		co.ID = fmt.Sprintf("co-%d", i)
+		sh.Process.EntityID = fmt.Sprintf("proc-%d", i)
+		co.Process.EntityID = sh.Process.EntityID
+		sh.OccurredAt = sh.OccurredAt.Add(time.Duration(i) * time.Minute)
+		co.OccurredAt = sh.OccurredAt.Add(time.Second)
+		for _, e := range []model.Event{sh, co} {
+			if w := request(t, h, "POST", "/v1/events", encode(t, e), ""); w.Code != 202 {
+				t.Fatalf("ingest: %d %s", w.Code, w.Body.String())
+			}
+		}
+	}
+	type page struct {
+		Incidents []model.Incident `json:"incidents"`
+		Next      string           `json:"next_cursor"`
+		Total     int              `json:"total"`
+	}
+	w := request(t, h, "GET", "/v1/incidents?limit=2&cursor=", nil, "")
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var first page
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Incidents) != 2 || first.Next == "" || first.Total != 4 {
+		t.Fatal(w.Body.String())
+	}
+	w = request(t, h, "GET", "/v1/incidents?limit=2&cursor="+first.Next, nil, "")
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var second page
+	if err := json.Unmarshal(w.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Incidents) != 2 || second.Next != "" || second.Incidents[0].ID == first.Incidents[0].ID {
+		t.Fatal(w.Body.String())
+	}
+	for _, path := range []string{"/v1/incidents?limit=2&cursor=invalid!", "/v1/incidents?offset=0&cursor=", "/v1/incidents?cursor=" + strings.Repeat("a", 600)} {
+		if w := request(t, h, "GET", path, nil, ""); w.Code != 400 {
+			t.Fatalf("accepted bad cursor %s: %d", path, w.Code)
+		}
+	}
+}

@@ -3,22 +3,25 @@ package engine
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"cloudruntimeguardian/internal/incidentindex"
 	"cloudruntimeguardian/internal/journal"
 	"cloudruntimeguardian/internal/model"
 )
 
 var (
-	ErrConflict = errors.New("idempotency key reused with different payload")
-	ErrNotFound = errors.New("incident not found")
-	ErrFull     = errors.New("ledger capacity reached; archival/rotation is required")
+	ErrConflict      = errors.New("idempotency key reused with different payload")
+	ErrNotFound      = errors.New("incident not found")
+	ErrFull          = errors.New("ledger capacity reached; archival/rotation is required")
+	ErrInvalidCursor = errors.New("invalid incident pagination cursor")
 )
 
 const DefaultMaxEvents = 50000
@@ -38,6 +41,7 @@ type Engine struct {
 	responseRequests map[string]model.ResponseAction
 	scopes           map[string]*scopeState
 	incidents        map[string]*model.Incident
+	incidentOrder    *incidentindex.Index
 	totalEvents      int
 }
 
@@ -59,7 +63,8 @@ func Open(path string, maxEvents int) (*Engine, error) {
 	}
 	en := &Engine{ledger: ledger, maxEvents: maxEvents,
 		events: make(map[string][32]byte), responseRequests: make(map[string]model.ResponseAction),
-		scopes: make(map[string]*scopeState), incidents: make(map[string]*model.Incident)}
+		scopes: make(map[string]*scopeState), incidents: make(map[string]*model.Incident),
+		incidentOrder: &incidentindex.Index{}}
 	for i, entry := range entries {
 		if entry.Kind == "event" {
 			if err := entry.Event.Validate(); err != nil {
@@ -253,6 +258,7 @@ func (en *Engine) tryMatch(shell, conn model.Event) {
 			{EventID: conn.ID, EventType: conn.Type, OccurredAt: conn.OccurredAt, ProcessID: conn.Process.EntityID, Destination: destination},
 		}, Responses: []model.ResponseAction{},
 	}
+	en.incidentOrder.Insert(incidentindex.Key{At: shell.OccurredAt, ID: id})
 }
 
 func clone(in *model.Incident) model.Incident {
@@ -262,28 +268,76 @@ func clone(in *model.Incident) model.Incident {
 	return out
 }
 
+// List uses the indexed incident order; complexity is O(log N + page size),
+// rather than cloning and sorting the entire incident map per request.
 func (en *Engine) List(limit, offset int) ([]model.Incident, int) {
 	en.mu.RLock()
 	defer en.mu.RUnlock()
-	items := make([]model.Incident, 0, len(en.incidents))
-	for _, in := range en.incidents {
-		items = append(items, clone(in))
+	keys := en.incidentOrder.Page(offset, limit)
+	items := make([]model.Incident, 0, len(keys))
+	for _, k := range keys {
+		items = append(items, clone(en.incidents[k.ID]))
 	}
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].FirstSeen.Equal(items[j].FirstSeen) {
-			return items[i].ID < items[j].ID
+	return items, en.incidentOrder.Len()
+}
+
+type pageCursor struct {
+	Version int       `json:"v"`
+	At      time.Time `json:"at"`
+	ID      string    `json:"id"`
+}
+
+func encodeCursor(k incidentindex.Key) string {
+	b, _ := json.Marshal(pageCursor{Version: 1, At: k.At.UTC(), ID: k.ID})
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+func decodeCursor(cursor string) (incidentindex.Key, error) {
+	if len(cursor) > 256 {
+		return incidentindex.Key{}, ErrInvalidCursor
+	}
+	b, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return incidentindex.Key{}, ErrInvalidCursor
+	}
+	var c pageCursor
+	if err := json.Unmarshal(b, &c); err != nil || c.Version != 1 || c.At.IsZero() || len(c.ID) != 32 || strings.Trim(c.ID, "0123456789abcdef") != "" {
+		return incidentindex.Key{}, ErrInvalidCursor
+	}
+	return incidentindex.Key{At: c.At, ID: c.ID}, nil
+}
+
+// ListCursor offers stable keyset pagination when newer incidents arrive
+// between client requests. Cursor is opaque; it never embeds credentials.
+func (en *Engine) ListCursor(limit int, cursor string) ([]model.Incident, int, string, error) {
+	if limit < 1 || limit > 500 {
+		return nil, 0, "", ErrInvalidCursor
+	}
+	var last incidentindex.Key
+	if cursor != "" {
+		var err error
+		last, err = decodeCursor(cursor)
+		if err != nil {
+			return nil, 0, "", err
 		}
-		return items[i].FirstSeen.After(items[j].FirstSeen)
-	})
-	count := len(items)
-	if offset >= count {
-		return []model.Incident{}, count
 	}
-	items = items[offset:]
-	if len(items) > limit {
-		items = items[:limit]
+	en.mu.RLock()
+	defer en.mu.RUnlock()
+	var keys []incidentindex.Key
+	if cursor == "" {
+		keys = en.incidentOrder.Page(0, limit+1)
+	} else {
+		keys = en.incidentOrder.PageAfter(last, limit+1)
 	}
-	return items, count
+	var next string
+	if len(keys) > limit {
+		next = encodeCursor(keys[limit-1])
+		keys = keys[:limit]
+	}
+	items := make([]model.Incident, 0, len(keys))
+	for _, k := range keys {
+		items = append(items, clone(en.incidents[k.ID]))
+	}
+	return items, en.incidentOrder.Len(), next, nil
 }
 
 func (en *Engine) Get(id string) (model.Incident, bool) {

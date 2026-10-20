@@ -97,3 +97,26 @@ retention/rotation, tenant isolation, incident deduplication across nodes, or
 kernel-level prevention. Per-event `fsync` favors correctness over throughput.
 Validate sensor coverage, CPU/latency, and data-loss behavior under realistic
 load before treating results as security signals for production decisions.
+
+## Indexed query milestone and journal safety
+
+Incident listing has an in-memory AVL index rebuilt entirely from the fsynced
+journal. Numeric offsets are supported for existing clients, while
+`GET /v1/incidents?limit=50&cursor=` enables stable keyset pagination during
+new ingestion. The cursor is opaque and **must not be interpreted as a
+security credential**. It is not a consistent multi-request snapshot if
+records are deleted in a future release.
+
+The journal rejects a second writer and now fails closed if its pathname is
+replaced, truncated, externally appended, or permissions/hardlink count change.
+It also rejects multiple JSON values on one replay line. If any guard fires,
+stop ingestion, preserve the source ledger, investigate the cause, and restart
+after correcting storage conditions. Never automatically reinitialize a
+failed ledger. The identity checks do not defend against a hostile process
+that already has filesystem write access or against all possible race windows.
+
+Run `go test -race ./...` before release. Tests include a Linux SIGKILL of a
+writer subprocess *after fsync*, crash reopening, cursor persistence after
+restart, and fail-closed behavior for external inode mutation. There is still
+**no** WAL compaction, external database, high availability, online backup, or
+validated cluster failure recovery.

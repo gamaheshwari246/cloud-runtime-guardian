@@ -28,8 +28,10 @@ type Entry struct {
 }
 
 type Journal struct {
-	file   *os.File
-	failed bool
+	file         *os.File
+	path         string
+	expectedSize int64
+	failed       bool
 }
 
 // Open locks the opened inode, refuses symlinks/hard links or loose file modes,
@@ -114,6 +116,11 @@ func Open(path string, maxRecords int) (*Journal, []Entry, error) {
 		if err := dec.Decode(&e); err != nil {
 			return closeOnError(fmt.Errorf("corrupt journal record at byte %d: %w", offset, err))
 		}
+		// Reject a second JSON value or trailing garbage on the same line.
+		var trailing json.RawMessage
+		if err := dec.Decode(&trailing); err != io.EOF {
+			return closeOnError(fmt.Errorf("unexpected trailing content at byte %d", offset))
+		}
 		if e.Version != 1 || (e.Kind != "event" && e.Kind != "response") ||
 			(e.Kind == "event" && (e.Event == nil || e.Response != nil)) ||
 			(e.Kind == "response" && (e.Response == nil || e.Event != nil)) {
@@ -125,10 +132,11 @@ func Open(path string, maxRecords int) (*Journal, []Entry, error) {
 		entries = append(entries, e)
 		offset += int64(len(line))
 	}
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+	end, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
 		return closeOnError(err)
 	}
-	return &Journal{file: f}, entries, nil
+	return &Journal{file: f, path: path, expectedSize: end}, entries, nil
 }
 
 // Append returns only after the record is written and fsynced. Once an append
@@ -147,6 +155,10 @@ func (j *Journal) Append(e Entry) error {
 		return errors.New("journal entry exceeds size limit")
 	}
 	b = append(b, '\n')
+	if err := j.checkIdentity(); err != nil {
+		j.failed = true
+		return fmt.Errorf("journal identity changed (restart required): %w", err)
+	}
 	n, err := j.file.Write(b)
 	if err == nil && n != len(b) {
 		err = io.ErrShortWrite
@@ -157,6 +169,35 @@ func (j *Journal) Append(e Entry) error {
 	if err != nil {
 		j.failed = true
 		return fmt.Errorf("journal commit failed (restart required): %w", err)
+	}
+	j.expectedSize += int64(len(b))
+	return nil
+}
+
+// checkIdentity stops serving writes after external replacement, truncation,
+// append, or permissions changes. These checks protect against accidental
+// logrotate/copytruncate and configuration errors; they are not a guarantee
+// against a malicious process with write access racing the filesystem.
+func (j *Journal) checkIdentity() error {
+	opened, err := j.file.Stat()
+	if err != nil {
+		return err
+	}
+	current, err := os.Lstat(j.path)
+	if err != nil {
+		return err
+	}
+	if !current.Mode().IsRegular() || !os.SameFile(opened, current) {
+		return errors.New("journal pathname no longer names the locked file")
+	}
+	if current.Mode().Perm()&0077 != 0 {
+		return errors.New("journal file permissions changed")
+	}
+	if stat, ok := opened.Sys().(*syscall.Stat_t); ok && stat.Nlink != 1 {
+		return errors.New("journal hard link count changed")
+	}
+	if opened.Size() != j.expectedSize {
+		return fmt.Errorf("journal was externally modified: size %d expected %d", opened.Size(), j.expectedSize)
 	}
 	return nil
 }

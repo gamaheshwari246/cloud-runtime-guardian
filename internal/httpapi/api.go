@@ -163,6 +163,19 @@ func (api *API) list(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, err.Error())
 		return
 	}
+	if _, supplied := r.URL.Query()["cursor"]; supplied {
+		if _, offsetSupplied := r.URL.Query()["offset"]; offsetSupplied {
+			problem(w, 400, "cursor and offset may not be combined")
+			return
+		}
+		items, total, next, err := api.Engine.ListCursor(limit, r.URL.Query().Get("cursor"))
+		if err != nil {
+			problem(w, 400, "invalid cursor")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"incidents": items, "total": total, "limit": limit, "next_cursor": next})
+		return
+	}
 	items, total := api.Engine.List(limit, offset)
 	writeJSON(w, 200, map[string]any{"incidents": items, "total": total, "limit": limit, "offset": offset})
 }

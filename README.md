@@ -39,7 +39,8 @@ The server uses a newline-terminated append-only JSONL journal, fsyncs accepted 
 | --- | --- | --- |
 | `GET` | `/healthz` | Liveness |
 | `POST` | `/v1/events` | Validate and durably ingest an event (`202` created, `200` duplicate, `409` conflicting ID) |
-| `GET` | `/v1/incidents?limit=100&offset=0` | List correlated incidents |
+| `GET` | `/v1/incidents?limit=100&offset=0` | Indexed incident listing with numeric offset |
+| `GET` | `/v1/incidents?limit=100&cursor=` | Stable, opaque keyset pagination; follow `next_cursor` |
 | `GET` | `/v1/incidents/{id}` | Incident + immutable evidence and response history |
 | `POST` | `/v1/incidents/{id}/response` | Record a **dry-run** containment proposal; no network changes |
 | `GET` | `/v1/stats` | Event / incident / response counts and capacity |
@@ -59,7 +60,7 @@ The response always includes `"mode":"dry_run"` and `"enforcement_applied":false
 ## Security defaults
 
 - The server listens **only on 127.0.0.1** by default.
-- For a non-loopback listener, configure distinct `CRG_INGEST_TOKEN` and `CRG_ADMIN_TOKEN` (at least 24 characters each), provide `-tls-cert` and `-tls-key`, and restrict network access. `CRG_API_TOKEN` is retained only for older loopback development usage. These bearer tokens do not replace production identity/RBAC.
+- To listen on a non-loopback address, configure **distinct** `CRG_INGEST_TOKEN` and `CRG_ADMIN_TOKEN` (minimum 24 characters each), and serve HTTPS with `-tls-cert` / `-tls-key`. The legacy `CRG_API_TOKEN` is for loopback development only; bearer credentials are not workload identity/RBAC.
 - JSON input is size-limited (32 KiB), unknown properties are rejected, and event identifiers are validated.
 - Event IDs and response request IDs are idempotency keys and remain effective after restart. Reusing an ID with different content returns `409`.
 - Dry-run response recording cannot initiate a kill, firewall rule, cloud API call, or container action.
@@ -69,18 +70,18 @@ The response always includes `"mode":"dry_run"` and `"enforcement_applied":false
 
 ## Known limitations (intentional)
 
-1. **No bundled kernel instrumentation:** the Tetragon JSONL collector ingests exported sensor events, but no eBPF sensor is bundled or validated on a live Linux/Kubernetes deployment. Linux boot identity, exported process IDs and workload labels still require live validation.
+1. **No bundled kernel instrumentation:** the Linux collector consumes Tetragon JSONL process-exec/connect events; no eBPF program ships in this repository, and the collector requires a separately configured Tetragon source.
 2. **One behavioral rule:** shell execution followed by external egress within 5 minutes, from the same process or its *immediate* child. This is a heuristic; legitimate administration can trigger it.
 3. **External-IP heuristic:** globally unicast, non-private destinations can still include reserved ranges. Future rules must use versioned customer-specific egress policies and IP classification; do not block on this alone.
 4. **No deep process ancestry:** multi-generation descendants are not yet linked. Process ID includes an opaque stable entity ID supplied by the sensor; the engine does not validate how it was constructed.
-5. **Single-node journal:** 50,000 events by default, no compaction, segmentation, HA, replication, or log rotation. When full, new unique events receive HTTP 507. Read-heavy and high-rate use cases need an indexed, bounded storage engine.
-6. **Fixed response capacity:** audit responses are durable and capped at the configured journal event capacity. A full response ledger refuses new response proposals (HTTP 507); archival, retention and compaction are not implemented.
+5. **Single-node journal:** 50,000 events by default; crash-tested fsynced append with writer locking and file identity checks, but no compaction, segmentation, HA, replication, or archival. When full, new unique events receive HTTP 507. Incident **queries** use a bounded-memory AVL order index rebuilt from the durable journal at startup; this is not a database replacement.
+6. **Bounded response count:** dry-run audit responses have the same configured capacity bound as events. Exhaustion returns HTTP 507; no retention management is implemented.
 7. **No policy enforcement, Kubernetes identity verification, or multi-tenant isolation.** The client-provided workload labels are not authenticated to a cluster API.
 8. **No comprehensive threat intelligence, malware scanning, kernel vulnerability handling, or guaranteed detection.** Events may be delayed or missing at their original source; the service cannot infer losses upstream.
 
 ## Next milestones
 
-See [`docs/roadmap.md`](docs/roadmap.md). The next priority is **validation against real Tetragon events on Linux/Kubernetes**, then high-volume indexed storage, retention, and authenticated workload identity before fleet management or enforcement.
+See [`docs/roadmap.md`](docs/roadmap.md). The next priority is **a real Linux sensor with workload identity**, before expanding to microsegmentation, response, and fleet management.
 
 ## Development
 
@@ -98,9 +99,9 @@ to remote IPs. See [Tetragon source notes](examples/tetragon/README.md).
 
 This is a **tested ingestion bridge, not production-ready EDR**. The exporter
 must be configured to emit connect events; host-node name and boot epoch must
-match. Multi-file rotation recovery, HA event queues, policy-based filtering,
+match. Automatic rotation recovery, HA event queues, policy-based filtering,
 large-volume indexing, authentication beyond one bearer token, complete
-full observability/alerting, and real containment remain unimplemented. The
+observability/alerting, and real containment remain unimplemented. The
 checkpoint is on the same local disk; operators must supervise and retain
 export logs until ingestion is confirmed. The fail-closed approach prioritizes
 correctness over availability.
@@ -132,3 +133,21 @@ Read the [cluster readiness runbook](docs/cluster-readiness.md) before deploying
 - **Not yet production certified:** container build and Kubernetes lifecycle
   require real runtime verification; no high-availability/retention solution,
   authenticated workload identity, live enforcement, or real sensor validation.
+
+## Indexed investigations and fault-injection tests
+
+New incidents are indexed by `(first_seen DESC, id ASC)` with an AVL tree.
+`GET /v1/incidents?limit=50&cursor=` returns `next_cursor` when more rows
+are available. Subsequent pages use `?limit=50&cursor=<next_cursor>`; do
+not combine `cursor` and `offset`. Invalid cursors return `400`.
+Existing `offset` pagination remains backwards-compatible. Cursor pages
+remain stable when newer events arrive; deletion/retention is not supported.
+The index is **reconstructed from fsynced journal entries after restart**;
+there is no separate index file to get out of sync with the ledger.
+
+`go test -race ./...` includes a killed-writer subprocess test on Linux,
+external journal replacement/truncation tests, malformed JSON replay tests,
+randomized indexed-pagination checks, API cursor tests, and journal restart
+recovery. `go test ./internal/incidentindex -run TestOrderedPaginationAndDedup -count=1`
+checks large randomized orderings. These tests do not simulate a power-loss
+filesystem or establish high-availability guarantees.
