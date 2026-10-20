@@ -161,3 +161,62 @@ cross-version restore validation before safe deletion can be enabled.
 This remains a single-process ledger, **not** a database with HA, replicated
 writes or incremental query indexes on disk. A snapshot of only the base
 `.jsonl` file is no longer a complete backup once segments exist.
+
+## Offline verified snapshot, restore, and backup retention
+
+The `ledgerctl` backup format is a bounded ZIP containing `MANIFEST.json`,
+`journal.jsonl`, and the full numbered WAL tree. Each file has a SHA-256
+checksum and uncompressed byte length in the manifest. ZIP CRCs are checked as
+well. A snapshot requires the **exclusive writer lock**: stop the server first.
+The tool never deletes WAL records, nor does it reset idempotency keys.
+
+```sh
+# Stop the server and collector before taking a consistent offline backup.
+mkdir -p ./backups
+chmod 700 ./backups
+
+go run ./cmd/ledgerctl -data ./data/journal.jsonl \
+  -max-records 2000000 \
+  -snapshot ./backups/crg-20261020T120000Z.crg-snapshot.zip
+
+# Integrity and checksum check (does not modify the source ledger):
+go run ./cmd/ledgerctl \
+  -verify-snapshot ./backups/crg-20261020T120000Z.crg-snapshot.zip
+
+# Restore into a NEW directory, never over an existing ledger. This verifies
+# all archive digests and fully replays the WAL before publishing the result.
+go run ./cmd/ledgerctl \
+  -restore-snapshot ./backups/crg-20261020T120000Z.crg-snapshot.zip \
+  -restore-dir ./restore-check
+
+# After manually confirming this restored dataset is usable, use:
+go run ./cmd/server -data ./restore-check/journal.jsonl
+
+# Retain 3 newest individually verified archives with the controlled filename
+# pattern crg-*.crg-snapshot.zip; leave authoritative WAL untouched.
+go run ./cmd/ledgerctl -prune-snapshots-dir ./backups -keep-snapshots 3
+```
+
+**Safety notes:** The restore destination must not exist and must be on a
+filesystem supporting atomic directory renames and directory fsync. Take
+snapshots on a trusted local filesystem, not an untrusted shared mount. Preserve
+both the backup and its keys/access controls using independent storage; the
+archive includes sensitive telemetry and is only file-permission protected, not
+encrypted. Archive creation checks capacity, file permissions, and source
+stability, and refuses existing target names. Restore extracts into a private
+temporary directory, checks digests, tests full WAL replay, and publishes it
+only on success. An interruption before publication leaves only a removable
+temporary directory; an interruption after publication leaves an intact
+restored directory. Clean up orphan `.crg-restore-*` directories after inspecting
+and confirming that no restore is running. Do not use this tool to restore
+onto an existing directory, or to take hot backups while the server is running.
+
+Backup retention only deletes matching **successfully verified** backup
+archives, keeping at least two. It is not regulatory data retention, a WAL
+truncation engine, or a durable state checkpoint for accelerated startup.
+The engine still reconstructs its in-memory state from all committed records.
+There is deliberately **no event TTL** in this milestone: deleting historical
+records would change replay and idempotency semantics. Before implementing
+actual ledger retention, design and validate a complete state snapshot
+(including event hashes, correlation indexes, incident history, and response
+idempotency), migration compatibility, and crash-safe checkpoint handoff.

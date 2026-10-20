@@ -169,3 +169,33 @@ Keep `journal.jsonl` **and** its `journal.jsonl.segments/` directory together
 for backup/restore. **This does not implement expiry or retention deletion:**
 archival retains all records and idempotency history. See
 [`docs/operations.md`](docs/operations.md) for crash recovery and limits.
+
+## Verifiable offline backups (snapshot milestone)
+
+The new `cmd/ledgerctl` can create authenticated-by-checksum offline backups
+of the base journal and all WAL segments, verify them, restore into a **new**
+folder, and keep a bounded number of verified backup archives. Backup creation
+requires stopping the server because it acquires the same exclusive ledger
+lock. This is a complete-ledger archival snapshot, not a serialized engine-state
+snapshot; WAL retention and startup replay remain unchanged.
+
+```sh
+mkdir -p backups && chmod 700 backups
+# Stop the server before this command:
+go run ./cmd/ledgerctl -data ./data/journal.jsonl \
+  -snapshot ./backups/crg-001.crg-snapshot.zip
+
+go run ./cmd/ledgerctl -verify-snapshot ./backups/crg-001.crg-snapshot.zip
+
+go run ./cmd/ledgerctl -restore-snapshot ./backups/crg-001.crg-snapshot.zip \
+  -restore-dir ./restored-001
+
+go run ./cmd/ledgerctl -prune-snapshots-dir ./backups -keep-snapshots 3
+```
+
+See [operations runbook](docs/operations.md#offline-verified-snapshot-restore-and-backup-retention)
+for safety boundaries, permissions, and recovery procedures. Archive checksums
+do not provide confidentiality or authenticate the archive against an attacker
+who can replace the ZIP and its manifest; store it in trusted, access-controlled
+(and ideally encrypted) backup storage. Cluster-validated operations and
+high-availability storage remain future work.
