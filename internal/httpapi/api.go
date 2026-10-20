@@ -158,6 +158,8 @@ func (api *API) response(w http.ResponseWriter, r *http.Request) {
 			problem(w, 404, err.Error())
 		case errors.Is(err, engine.ErrConflict):
 			problem(w, 409, err.Error())
+		case errors.Is(err, engine.ErrFull):
+			problem(w, 507, err.Error())
 		default:
 			problem(w, 500, "response audit storage failed")
 		}

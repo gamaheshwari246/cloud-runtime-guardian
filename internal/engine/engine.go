@@ -18,15 +18,16 @@ import (
 var (
 	ErrConflict = errors.New("idempotency key reused with different payload")
 	ErrNotFound = errors.New("incident not found")
-	ErrFull     = errors.New("ledger event capacity reached; archival/rotation is required")
+	ErrFull     = errors.New("ledger capacity reached; archival/rotation is required")
 )
 
 const DefaultMaxEvents = 50000
 
 type indexedEvent struct{ e model.Event }
 type scopeState struct {
-	shells      []indexedEvent
-	connections []indexedEvent
+	shells           map[string][]indexedEvent
+	connections      map[string][]indexedEvent
+	childConnections map[string][]indexedEvent
 }
 
 type Engine struct {
@@ -80,9 +81,9 @@ func Open(path string, maxEvents int) (*Engine, error) {
 		}
 	}
 	// Replays are bounded too: opening an oversized ledger is explicit error.
-	if en.totalEvents > maxEvents {
+	if en.totalEvents > maxEvents || len(en.responseRequests) > maxEvents {
 		ledger.Close()
-		return nil, fmt.Errorf("existing ledger has %d events; increase max-events or archive", en.totalEvents)
+		return nil, fmt.Errorf("existing ledger exceeds configured capacity; increase max-events or archive")
 	}
 	return en, nil
 }
@@ -129,20 +130,36 @@ func (en *Engine) applyEvent(e model.Event) (bool, error) {
 	scope := e.Scope()
 	st := en.scopes[scope]
 	if st == nil {
-		st = &scopeState{}
+		st = &scopeState{
+			shells:           make(map[string][]indexedEvent),
+			connections:      make(map[string][]indexedEvent),
+			childConnections: make(map[string][]indexedEvent),
+		}
 		en.scopes[scope] = st
 	}
 	if e.Type == model.EventProcessExec && model.IsShell(e.Process.Executable) {
-		// Scanning only same-workload connection candidates, not all hosts.
-		for _, conn := range st.connections {
+		// Index by stable process entity rather than scanning unrelated flows.
+		// A connection may arrive before the corresponding execution event.
+		for _, conn := range st.connections[e.Process.EntityID] {
 			en.tryMatch(e, conn.e)
 		}
-		st.shells = append(st.shells, indexedEvent{e: e})
+		for _, conn := range st.childConnections[e.Process.EntityID] {
+			en.tryMatch(e, conn.e)
+		}
+		st.shells[e.Process.EntityID] = append(st.shells[e.Process.EntityID], indexedEvent{e: e})
 	} else if e.Type == model.EventNetworkConnect && model.ExternalIP(e.Network.DestinationIP) {
-		for _, shell := range st.shells {
+		for _, shell := range st.shells[e.Process.EntityID] {
 			en.tryMatch(shell.e, e)
 		}
-		st.connections = append(st.connections, indexedEvent{e: e})
+		if e.Process.ParentEntityID != "" {
+			for _, shell := range st.shells[e.Process.ParentEntityID] {
+				en.tryMatch(shell.e, e)
+			}
+		}
+		st.connections[e.Process.EntityID] = append(st.connections[e.Process.EntityID], indexedEvent{e: e})
+		if e.Process.ParentEntityID != "" {
+			st.childConnections[e.Process.ParentEntityID] = append(st.childConnections[e.Process.ParentEntityID], indexedEvent{e: e})
+		}
 	}
 	return true, nil
 }
@@ -237,6 +254,9 @@ func (en *Engine) DryRunResponse(r model.ResponseAction) (model.ResponseAction, 
 			return model.ResponseAction{}, false, ErrConflict
 		}
 		return prev, false, nil
+	}
+	if len(en.responseRequests) >= en.maxEvents {
+		return model.ResponseAction{}, false, ErrFull
 	}
 	r.Mode = "dry_run"
 	r.EnforcementApplied = false

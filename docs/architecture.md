@@ -64,6 +64,6 @@ The events may **arrive in either order**; matching always uses their timestamps
 
 ## Operations and scalability
 
-The current in-memory index stores candidate shell executions and external connections per scope; each new candidate scans possible counterparts within that scope. This is **not a production throughput design**. Before scaling, index by process entity ID, maintain a bounded event-time window, archive old events, and use an efficient state store. Favor explicit event-loss/backpressure metrics over silent drops.
+The current in-memory index partitions events by host, boot, workload **and stable process entity ID**, including an immediate-child lookup. It avoids scanning unrelated process connections, while preserving out-of-order matching. It remains a **bounded single-node prototype**, not a production throughput design: candidates persist until a journal restart/archive; hot processes can create many incident pairs. A production engine needs an explicit late-event policy, bounded event-time retention, archival, indexed persistent state, and load tests. Favor explicit event-loss/backpressure metrics over silent drops.
 
 For future true containment, use separate signed policy decisions and a scoped response controller, with testable rollback and control-plane-survivable connectivity. Never promote the current dry-run proposal endpoint to direct enforcement without authorization and safety gates.

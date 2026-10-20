@@ -256,3 +256,67 @@ func TestTruncatedTailRecoveredAndCommittedCorruptionRejected(t *testing.T) {
 		t.Fatal("corrupted committed record was ignored")
 	}
 }
+
+func TestProcessIndexDoesNotCrossEntities(t *testing.T) {
+	en, _ := openTest(t)
+	shell, conn := testEvents()
+	for i := 0; i < 200; i++ {
+		other := conn
+		other.ID = fmt.Sprintf("unrelated-%03d", i)
+		other.Process.EntityID = fmt.Sprintf("other-proc-%03d", i)
+		other.Process.ParentEntityID = ""
+		mustIngest(t, en, other)
+	}
+	mustIngest(t, en, shell)
+	if _, count := en.List(10, 0); count != 0 {
+		t.Fatalf("unrelated entities produced %d incidents", count)
+	}
+	// A child process that sent a connection before the shell's event
+	// arrived must still link to the parent shell by stable entity ID.
+	child := conn
+	child.ID = "conn-child"
+	child.Process.EntityID = "child-proc"
+	child.Process.ParentEntityID = shell.Process.EntityID
+	mustIngest(t, en, child)
+	if _, count := en.List(10, 0); count != 1 {
+		t.Fatalf("child correlation expected 1 incident, got %d", count)
+	}
+}
+
+func TestDryRunResponseCapacityAndReplay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.journal")
+	en, err := Open(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shell, conn := testEvents()
+	mustIngest(t, en, shell)
+	mustIngest(t, en, conn)
+	entries, _ := en.List(1, 0)
+	if len(entries) != 1 {
+		t.Fatal("missing incident")
+	}
+	action := model.ResponseAction{IncidentID: entries[0].ID, Action: "block_workload_egress", Reason: "test proposal", RequestID: "r-1"}
+	if _, created, err := en.DryRunResponse(action); err != nil || !created {
+		t.Fatalf("first response: %v", err)
+	}
+	action.RequestID = "r-2"
+	if _, created, err := en.DryRunResponse(action); err != nil || !created {
+		t.Fatalf("second response: %v", err)
+	}
+	action.RequestID = "r-3"
+	if _, _, err := en.DryRunResponse(action); !errors.Is(err, ErrFull) {
+		t.Fatalf("expected capacity error, got %v", err)
+	}
+	if err := en.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if stats := reopened.Stats(); stats.DryRunResponses != 2 {
+		t.Fatalf("responses lost on restart: %+v", stats)
+	}
+}
