@@ -151,3 +151,21 @@ randomized indexed-pagination checks, API cursor tests, and journal restart
 recovery. `go test ./internal/incidentindex -run TestOrderedPaginationAndDedup -count=1`
 checks large randomized orderings. These tests do not simulate a power-loss
 filesystem or establish high-availability guarantees.
+
+### Segmented durable WAL (offline compaction milestone)
+
+New journal writes roll into numbered, fsynced WAL segments after 8 MiB.
+Existing `journal.jsonl` files remain readable without destructive migration.
+All segments are replayed and verified on restart, with missing-segment
+checks. To verify or losslessly gzip-compress closed segments **while the
+server is stopped**, run:
+
+```sh
+go run ./cmd/ledgerctl -data ./data/journal.jsonl
+go run ./cmd/ledgerctl -data ./data/journal.jsonl -compact-closed
+```
+
+Keep `journal.jsonl` **and** its `journal.jsonl.segments/` directory together
+for backup/restore. **This does not implement expiry or retention deletion:**
+archival retains all records and idempotency history. See
+[`docs/operations.md`](docs/operations.md) for crash recovery and limits.

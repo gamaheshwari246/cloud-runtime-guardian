@@ -120,3 +120,44 @@ writer subprocess *after fsync*, crash reopening, cursor persistence after
 restart, and fail-closed behavior for external inode mutation. There is still
 **no** WAL compaction, external database, high availability, online backup, or
 validated cluster failure recovery.
+
+## Segmented WAL and lossless offline compaction
+
+The original `-data` path is kept as an immutable-compatible legacy segment.
+After it reaches 8 MiB, further writes are made to consecutive numbered files
+under `<data>.segments/`, with a durably fsynced `HEAD` high-watermark. A
+missing segment or broken sequence is a **startup failure**, not a fresh start.
+Only the final active segment may have an incomplete trailing line repaired.
+`HEAD` and numbered WAL files are part of one logical database. **Always back
+up the original journal and the full `.segments/` directory together**, with
+the server stopped or with an application-consistent filesystem snapshot.
+Do not let a generic logrotate process touch these files.
+
+The following commands must be run with the server **stopped**. The verifier
+locks the same original file as the writer; it refuses another concurrent
+writer. Verify and optionally compress only *closed* numbered segments:
+
+```sh
+go run ./cmd/ledgerctl -data ./data/journal.jsonl -max-records 100000
+# After a separate, restorable backup:
+go run ./cmd/ledgerctl -data ./data/journal.jsonl -max-records 100000 -compact-closed
+```
+
+Compression uses `fsync(temp)` -> atomic rename to `.wal.gz` -> `fsync(dir)`
+-> verification against the original -> delete original -> `fsync(dir)`.
+A crash after rename can leave both formats, in which case the next startup
+verifies the two copies agree. Corruption in either copy causes startup to
+fail closed. Historical IDs and records are never discarded. Re-compressing
+an already archived segment does nothing.
+
+**Retention is intentionally indefinite in this release.** Compression
+reduces storage space but not replay count or in-memory event capacity. Do not
+manually delete archived WAL files to enforce a TTL: that would remove the
+idempotency keys and evidence needed for deterministic replay. A future
+snapshot/retention milestone must preserve event hashes, incidents, action
+history and the correlation window, define legal/audit retention, and include
+cross-version restore validation before safe deletion can be enabled.
+
+This remains a single-process ledger, **not** a database with HA, replicated
+writes or incremental query indexes on disk. A snapshot of only the base
+`.jsonl` file is no longer a complete backup once segments exist.
