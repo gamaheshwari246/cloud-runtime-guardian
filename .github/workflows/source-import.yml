@@ -1,0 +1,45 @@
+name: Import Cloud Runtime Guardian source
+on:
+  push:
+    paths:
+      - '.github/workflows/source-import.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Verify and extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d .bootstrap/source.tar.xz.b64 > /tmp/cloud-runtime-guardian-source.tar.xz
+          mkdir -p /tmp/crg-import
+          tar -xJf /tmp/cloud-runtime-guardian-source.tar.xz -C /tmp/crg-import
+          test -f /tmp/crg-import/go.mod
+          test -f /tmp/crg-import/internal/collector/collector.go
+          test -f /tmp/crg-import/internal/tetragon/convert.go
+          cd /tmp/crg-import
+          go vet ./...
+          go test -race ./...
+      - name: Publish validated source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .bootstrap/source.tar.xz.b64 .github/workflows/source-import.yml
+          rmdir .bootstrap
+          tar -xJf /tmp/cloud-runtime-guardian-source.tar.xz
+          git add -A
+          git commit -m "Publish Go runtime security service and Tetragon collector"
+          git push origin HEAD:main
