@@ -1,0 +1,8 @@
+/data/
+/bin/
+*.test
+*.out
+coverage.html
+.idea/
+.vscode/
+.DS_Store
