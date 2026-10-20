@@ -1,0 +1,22 @@
+name: Go validation
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify formatting
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
+      - name: Static analysis
+        run: go vet ./...
+      - name: Race-enabled tests
+        run: go test -count=1 -race ./...
