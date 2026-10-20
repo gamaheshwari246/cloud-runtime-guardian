@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 
 	"cloudruntimeguardian/internal/model"
 )
@@ -122,25 +123,41 @@ type boundSource struct {
 }
 
 type Verifier struct {
-	sources  []boundSource
+	sources  atomic.Pointer[[]boundSource]
 	resolver Resolver
+	pending  chan struct{} // cap live Kubernetes API lookups per server
 }
 
 func New(resolver Resolver, nodes []NodeCredential) (*Verifier, error) {
-	if resolver == nil || len(nodes) == 0 || len(nodes) > 1024 {
-		return nil, errors.New("resolver and source credentials required")
+	if resolver == nil {
+		return nil, errors.New("resolver required")
+	}
+	v := &Verifier{resolver: resolver, pending: make(chan struct{}, 16)}
+	if err := v.ReplaceCredentials(nodes); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// ReplaceCredentials swaps the entire immutable credential set atomically.
+// In-flight verifications use their original snapshot; new calls use the new
+// credentials. A failed rotation leaves the last known good set active.
+func (v *Verifier) ReplaceCredentials(nodes []NodeCredential) error {
+	if len(nodes) == 0 || len(nodes) > 1024 {
+		return errors.New("collector credential count must be 1..1024")
 	}
 	seenNodes, seenTokens := map[string]bool{}, map[[32]byte]bool{}
-	v := &Verifier{resolver: resolver}
+	next := make([]boundSource, 0, len(nodes))
 	for _, n := range nodes {
 		h := sha256.Sum256([]byte(n.Token))
 		if len(n.Token) < 32 || len(n.Token) > 4096 || len(n.Node) > 253 || !validNode.MatchString(n.Node) || seenNodes[n.Node] || seenTokens[h] {
-			return nil, errors.New("invalid or duplicate source credential")
+			return errors.New("invalid or duplicate source credential")
 		}
 		seenNodes[n.Node], seenTokens[h] = true, true
-		v.sources = append(v.sources, boundSource{node: n.Node, hash: h})
+		next = append(next, boundSource{node: n.Node, hash: h})
 	}
-	return v, nil
+	v.sources.Store(&next)
+	return nil
 }
 
 // authenticate scans every registered digest without early-returning on
@@ -155,7 +172,11 @@ func (v *Verifier) authenticate(header string) (string, error) {
 	}
 	digest := sha256.Sum256([]byte(token))
 	match, node := 0, ""
-	for _, src := range v.sources {
+	current := v.sources.Load()
+	if current == nil {
+		return "", ErrUnauthenticated
+	}
+	for _, src := range *current {
 		equal := subtle.ConstantTimeCompare(digest[:], src.hash[:])
 		if equal == 1 {
 			node = src.node
@@ -194,6 +215,16 @@ func (v *Verifier) Verify(ctx context.Context, authorization string, e model.Eve
 	if w.Namespace == "" || w.Pod == "" || w.PodUID == "" || w.ContainerID == "" || !validDNS.MatchString(w.Namespace) || !validDNS.MatchString(w.Pod) ||
 		w.ID != hash("container", w.ContainerID) {
 		return e, fmt.Errorf("%w: incomplete or inconsistent workload identity", ErrMismatch)
+	}
+	// Reject excess work explicitly so the collector retries from its durable
+	// checkpoint; do not overload the Kubernetes API or silently lose events.
+	select {
+	case v.pending <- struct{}{}:
+		defer func() { <-v.pending }()
+	case <-ctx.Done():
+		return e, fmt.Errorf("%w: lookup canceled", ErrUnavailable)
+	default:
+		return e, fmt.Errorf("%w: identity lookup concurrency limit", ErrUnavailable)
 	}
 	pod, err := v.resolver.LookupPod(ctx, w.Namespace, w.Pod)
 	if err != nil {

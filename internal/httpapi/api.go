@@ -21,12 +21,13 @@ import (
 const maxRequestBytes = 32 << 10
 
 type API struct {
-	Engine          *engine.Engine
-	Token           string             // backward-compatible single-token development mode
-	IngestToken     string             // collector-only credential; never grants incident read access
-	AdminToken      string             // analyst/read-response credential; never grants event writes
-	ContainmentMode string             // empty disables state changes; simulate/kubernetes require explicit operator opt-in
-	Identity        *identity.Verifier // when set, node credentials and live pod checks are mandatory
+	Engine               *engine.Engine
+	Token                string // backward-compatible single-token development mode
+	IngestToken          string // collector-only credential; never grants incident read access
+	AdminToken           string // analyst/read-response credential; never grants event writes
+	ContainmentMode      string // empty disables state changes; simulate/kubernetes require explicit operator opt-in
+	RequireCollectorMTLS bool
+	Identity             *identity.Verifier // when set, node credentials and live pod checks are mandatory
 }
 
 func (api *API) Handler() http.Handler {
@@ -129,7 +130,13 @@ func (api *API) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if api.Identity != nil {
-		verified, err := api.Identity.Verify(r.Context(), r.Header.Get("Authorization"), e)
+		var verified model.Event
+		var err error
+		if api.RequireCollectorMTLS {
+			verified, err = api.Identity.VerifyMTLS(r.Context(), r.Header.Get("Authorization"), e, r.TLS)
+		} else {
+			verified, err = api.Identity.Verify(r.Context(), r.Header.Get("Authorization"), e)
+		}
 		if err != nil {
 			status := identity.StatusCode(err)
 			if status == http.StatusServiceUnavailable {

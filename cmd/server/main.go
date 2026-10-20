@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"cloudruntimeguardian/internal/engine"
 	"cloudruntimeguardian/internal/httpapi"
 	"cloudruntimeguardian/internal/identity"
+	"cloudruntimeguardian/internal/tlscerts"
 )
 
 func main() {
@@ -25,6 +27,7 @@ func main() {
 	maxEvents := flag.Int("max-events", engine.DefaultMaxEvents, "maximum persisted events per journal before manual archival")
 	tlsCert := flag.String("tls-cert", "", "PEM TLS certificate for HTTPS listener")
 	tlsKey := flag.String("tls-key", "", "PEM TLS private key for HTTPS listener")
+	collectorCA := flag.String("collector-ca", "", "optional PEM CA bundle for collector mutual TLS")
 	flag.Parse()
 
 	host, _, err := net.SplitHostPort(*addr)
@@ -42,6 +45,17 @@ func main() {
 		}
 	}
 	strict := os.Getenv("CRG_K8S_VERIFY") == "1"
+	requireCollectorMTLS := os.Getenv("CRG_REQUIRE_COLLECTOR_MTLS") == "1"
+	if os.Getenv("CRG_REQUIRE_COLLECTOR_MTLS") != "" && os.Getenv("CRG_REQUIRE_COLLECTOR_MTLS") != "0" && !requireCollectorMTLS {
+		log.Fatal("CRG_REQUIRE_COLLECTOR_MTLS must be 0 or 1")
+	}
+	if requireCollectorMTLS && (!strict || *collectorCA == "" || *tlsCert == "") {
+		log.Fatal("mTLS requires strict Kubernetes mode, TLS listener and -collector-ca")
+	}
+	if *collectorCA != "" && !requireCollectorMTLS {
+		log.Fatal("-collector-ca requires CRG_REQUIRE_COLLECTOR_MTLS=1")
+	}
+
 	if strict && (admin == "" || ingest != "" || legacy != "") {
 		log.Fatal("strict Kubernetes mode requires only CRG_ADMIN_TOKEN; collector credentials come from CRG_NODE_CREDENTIALS_FILE")
 	}
@@ -95,11 +109,38 @@ func main() {
 	if mode == "kubernetes" && !strict {
 		log.Fatal("Kubernetes containment requires strict node and workload identity verification")
 	}
+	// Standard Kubernetes NetworkPolicies are additive. An empty egress
+	// rule cannot guarantee isolation if another selected policy permits
+	// egress. Keep this backend restricted to explicitly authorized labs.
+	if mode == "kubernetes" && os.Getenv("CRG_EXPERIMENTAL_K8S_CONTAINMENT") != "1" {
+		log.Fatal("Kubernetes NetworkPolicy containment is experimental; require CRG_EXPERIMENTAL_K8S_CONTAINMENT=1 for staging only")
+	}
 	if mode == "simulate" && !local {
 		log.Fatal("simulation mode is allowed only on loopback")
 	}
 	if mode != "" && admin == "" {
 		log.Fatal("containment requires a dedicated administrator credential")
+	}
+	// SIGHUP rotates node tokens atomically without interrupting in-flight requests.
+	// Kubernetes Secret volume projections update symlinks; each reload resolves
+	// and validates the complete replacement before it can become active.
+	if strict {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		defer signal.Stop(hup)
+		go func() {
+			for range hup {
+				updated, err := identity.LoadCredentials(os.Getenv("CRG_NODE_CREDENTIALS_FILE"))
+				if err == nil {
+					err = verifier.ReplaceCredentials(updated)
+				}
+				if err != nil {
+					log.Printf("collector credential rotation rejected: %v", err)
+				} else {
+					log.Printf("collector credentials rotated successfully")
+				}
+			}
+		}()
 	}
 	stop, stopNotify := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopNotify()
@@ -137,7 +178,7 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr: *addr, Handler: (&httpapi.API{Engine: en, Token: legacy, IngestToken: ingest, AdminToken: admin, Identity: verifier, ContainmentMode: mode}).Handler(),
+		Addr: *addr, Handler: (&httpapi.API{Engine: en, Token: legacy, IngestToken: ingest, AdminToken: admin, Identity: verifier, ContainmentMode: mode, RequireCollectorMTLS: requireCollectorMTLS}).Handler(),
 		ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
 		MaxHeaderBytes: 1 << 16,
@@ -150,7 +191,23 @@ func main() {
 			log.Printf("shutdown: %v", err)
 		}
 	}()
-	srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13}
+	if *tlsCert != "" {
+		tlsConfig.GetCertificate = tlscerts.Server(*tlsCert, *tlsKey)
+	}
+	if requireCollectorMTLS {
+		caPEM, err := os.ReadFile(*collectorCA)
+		if err != nil {
+			log.Fatalf("read collector CA: %v", err)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(caPEM) {
+			log.Fatal("collector CA contains no valid certificates")
+		}
+		tlsConfig.ClientCAs = roots
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven // admin/health clients may omit cert; event handler requires it
+	}
+	srv.TLSConfig = tlsConfig
 	log.Printf("listening on %s (journal=%s, capacity=%d, authenticated=%t, tls=%t, containment-mode=%s)", *addr, *data, *maxEvents, legacy != "" || ingest != "" || admin != "", *tlsCert != "", mode)
 	var serveErr error
 	if *tlsCert != "" {

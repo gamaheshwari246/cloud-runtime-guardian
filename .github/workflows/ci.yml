@@ -12,3 +12,11 @@ jobs:
           go-version: '1.26'
       - run: go vet ./...
       - run: go test -race ./...
+      - name: Format check
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Compile all binaries
+        run: go build -trimpath ./cmd/...
+      - name: Go security regression tests
+        run: go test -count=1 ./internal/identity ./internal/httpapi ./internal/containment ./internal/journal ./internal/tlscerts
+      - name: Loopback ingestion and recovery smoke test
+        run: ./scripts/verify-local-release.sh

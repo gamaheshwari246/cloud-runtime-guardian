@@ -1,6 +1,7 @@
 # Template, not a completed production cluster installation.
-# Required secrets: crg-api-credentials (ingest-token, admin-token),
-# crg-tls (tls.crt, tls.key), crg-node-credentials (credentials.json).
+# Required secrets: crg-api-credentials (admin-token), crg-tls (tls.crt, tls.key),
+# crg-node-credentials (credentials.json), crg-collector-ca (ca.crt).
+# Strict server uses collector node-specific tokens AND client mTLS certificates.
 # Apply identity-rbac.yaml first; replace its namespace placeholder.
 # Use an immutable published image digest.
 apiVersion: v1
@@ -50,10 +51,14 @@ spec:
             - /etc/crg/tls/tls.crt
             - -tls-key
             - /etc/crg/tls/tls.key
+            - -collector-ca
+            - /etc/crg/collector-ca/ca.crt
           ports:
             - {name: https, containerPort: 9443}
           env:
             - name: CRG_K8S_VERIFY
+              value: "1"
+            - name: CRG_REQUIRE_COLLECTOR_MTLS
               value: "1"
             - name: CRG_NODE_CREDENTIALS_FILE
               value: /etc/crg/identity/credentials.json
@@ -81,11 +86,14 @@ spec:
             - {name: storage, mountPath: /var/lib/crg}
             - {name: tls, mountPath: /etc/crg/tls, readOnly: true}
             - {name: identity, mountPath: /etc/crg/identity, readOnly: true}
+            - {name: collector-ca, mountPath: /etc/crg/collector-ca, readOnly: true}
       volumes:
         - name: tls
           secret: {secretName: crg-tls, defaultMode: 0440}
         - name: identity
           secret: {secretName: crg-node-credentials, defaultMode: 0440}
+        - name: collector-ca
+          secret: {secretName: crg-collector-ca, defaultMode: 0440}
   volumeClaimTemplates:
     - metadata: {name: storage}
       spec:

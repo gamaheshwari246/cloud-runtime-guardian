@@ -26,11 +26,30 @@ pod deletion state against the live Kubernetes API before durable ingestion.
 The feature requires `CRG_K8S_VERIFY=1`, HTTPS, a private
 `CRG_NODE_CREDENTIALS_FILE`, an administrator token, and a Kubernetes service
 account permitted to `get` pods. It rejects stale pods and fails closed when
-identity cannot be verified. Source authentication is **not** hardware attestation.
+identity cannot be verified. Optional mutual TLS binds a collector certificate URI SAN to its node credential; neither mechanism is hardware attestation.
 
 See [Kubernetes identity deployment and threat model](docs/kubernetes-identity.md)
 and the templates `deploy/kubernetes/identity-rbac.yaml` and
-`deploy/kubernetes/server.yaml`. No real-cluster validation has yet been done.
+`deploy/kubernetes/server.yaml`. Collector mTLS can be enabled with `CRG_REQUIRE_COLLECTOR_MTLS=1` and a dedicated `-collector-ca` PEM file. See the identity guide for certificate URI SAN requirements. No real-cluster validation has yet been done.
+
+## Production readiness boundary
+
+This is **not** a certified production product. The documented Kubernetes
+NetworkPolicy backend is experimental because K8s allow policies are additive:
+creation of an empty-egress policy cannot guarantee workload isolation if
+another policy permits egress. Production use also requires a distributed
+storage/fencing architecture, real CNI tests, and extended soak testing.
+See [release and production validation gates](docs/production-validation.md).
+
+Current offline work includes TLS 1.3 collector mTLS, node credential rotation,
+certificate reload on new handshakes, fail-closed source verification, bounded
+load testing, local release verification, and a staging CNI acceptance script.
+
+Quick local release check:
+
+```sh
+./scripts/verify-local-release.sh
+```
 
 ## Run it
 
@@ -98,7 +117,7 @@ The response always includes `"mode":"dry_run"` and `"enforcement_applied":false
 - The legacy `/response` endpoint is always dry-run. The separate containment endpoints can alter Kubernetes policies **only** when an operator explicitly opts in, requires a dedicated admin credential, and enables strict verified workload identity.
 - The ledger is created with restrictive permissions. If a committed journal record is corrupt, the service refuses startup rather than silently discarding audit data.
 
-**Do not deploy as a production EDR/runtime prevention product.** For credential separation, HTTPS, persistent storage, and container guidance, see [`docs/operations.md`](docs/operations.md). See [`docs/threat-model.md`](docs/threat-model.md) and the limitations below.
+**Do not deploy as a production EDR/runtime prevention product.** For credential separation, optional collector mTLS, HTTPS, persistent storage, and container guidance, see [`docs/operations.md`](docs/operations.md). See [`docs/threat-model.md`](docs/threat-model.md) and the limitations below.
 
 ## Current limitations
 
@@ -113,7 +132,7 @@ Review [containment](docs/containment.md), [operations](docs/operations.md), and
 
 ## Development
 
-The Go standard library is the only dependency. `internal/engine` owns replay-safe correlation; `internal/journal` owns durability; `internal/httpapi` owns API parsing and transport. No runtime component attempts to modify machine/network state.
+The Go standard library is the only dependency. `internal/engine` owns replay-safe correlation; `internal/journal` owns durability; `internal/httpapi` owns API parsing and transport. The runtime defaults to observation-only; an explicitly enabled Kubernetes containment backend can modify pod labels and NetworkPolicies. See the containment safety guide.
 
 ## Linux Tetragon live telemetry bridge
 
@@ -129,7 +148,7 @@ This is a **tested ingestion bridge, not production-ready EDR**. The exporter
 must be configured to emit connect events; host-node name and boot epoch must
 match. Automatic rotation recovery, HA event queues, policy-based filtering,
 large-volume indexing, authentication beyond one bearer token, complete
-observability/alerting, and real containment remain unimplemented. The
+full-scale observability/alerting, production-validated containment, and certificate enrollment remain incomplete. The
 checkpoint is on the same local disk; operators must supervise and retain
 export logs until ingestion is confirmed. The fail-closed approach prioritizes
 correctness over availability.
