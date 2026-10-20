@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -18,8 +19,10 @@ import (
 const maxRequestBytes = 32 << 10
 
 type API struct {
-	Engine *engine.Engine
-	Token  string
+	Engine      *engine.Engine
+	Token       string // backward-compatible single-token development mode
+	IngestToken string // collector-only credential; never grants incident read access
+	AdminToken  string // analyst/read-response credential; never grants event writes
 }
 
 func (api *API) Handler() http.Handler {
@@ -53,12 +56,27 @@ func (api *API) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && api.Token != "" {
-			supplied := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if len(supplied) != len(api.Token) || subtle.ConstantTimeCompare([]byte(supplied), []byte(api.Token)) != 1 {
-				w.Header().Set("WWW-Authenticate", "Bearer")
-				problem(w, 401, "unauthorized")
-				return
+		if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+			wanted := api.AdminToken
+			if r.URL.Path == "/v1/events" {
+				wanted = api.IngestToken
+			}
+			if wanted == "" {
+				wanted = api.Token
+			}
+			if api.IngestToken != "" || api.AdminToken != "" || api.Token != "" {
+				if wanted == "" {
+					w.Header().Set("WWW-Authenticate", "Bearer")
+					problem(w, 401, "credential not configured for this role")
+					return
+				}
+				supplied := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				suppliedHash, wantedHash := sha256.Sum256([]byte(supplied)), sha256.Sum256([]byte(wanted))
+				if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || subtle.ConstantTimeCompare(suppliedHash[:], wantedHash[:]) != 1 {
+					w.Header().Set("WWW-Authenticate", "Bearer")
+					problem(w, 401, "unauthorized")
+					return
+				}
 			}
 		}
 		mux.ServeHTTP(w, r)

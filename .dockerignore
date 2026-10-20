@@ -1,0 +1,11 @@
+.git
+.github
+bin
+data
+*.zip
+*.tar
+*.bundle
+*.log
+*.jsonl
+!examples/events.jsonl
+!examples/tetragon/*.jsonl

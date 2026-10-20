@@ -1,0 +1,87 @@
+# Template, not a completed production cluster installation.
+# Required secrets: crg-api-credentials (ingest-token, admin-token),
+# crg-tls (tls.crt, tls.key). Supply a published, immutable image digest.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-runtime-guardian
+  labels: {app: cloud-runtime-guardian}
+spec:
+  type: ClusterIP
+  selector: {app: cloud-runtime-guardian}
+  ports:
+    - name: https
+      port: 9443
+      targetPort: https
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cloud-runtime-guardian
+spec:
+  serviceName: cloud-runtime-guardian
+  replicas: 1
+  selector:
+    matchLabels: {app: cloud-runtime-guardian}
+  template:
+    metadata:
+      labels: {app: cloud-runtime-guardian}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: ghcr.io/REPLACE_WITH_OWNER/cloud-runtime-guardian@sha256:REPLACE_WITH_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          args:
+            - -addr
+            - 0.0.0.0:9443
+            - -data
+            - /var/lib/crg/journal.jsonl
+            - -tls-cert
+            - /etc/crg/tls/tls.crt
+            - -tls-key
+            - /etc/crg/tls/tls.key
+          ports:
+            - {name: https, containerPort: 9443}
+          env:
+            - name: CRG_INGEST_TOKEN
+              valueFrom:
+                secretKeyRef: {name: crg-api-credentials, key: ingest-token}
+            - name: CRG_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: {name: crg-api-credentials, key: admin-token}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /healthz, port: https, scheme: HTTPS}
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet: {path: /healthz, port: https, scheme: HTTPS}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: https, scheme: HTTPS}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: storage, mountPath: /var/lib/crg}
+            - {name: tls, mountPath: /etc/crg/tls, readOnly: true}
+      volumes:
+        - name: tls
+          secret: {secretName: crg-tls, defaultMode: 0440}
+  volumeClaimTemplates:
+    - metadata: {name: storage}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 5Gi}

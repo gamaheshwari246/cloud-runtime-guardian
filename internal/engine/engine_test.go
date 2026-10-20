@@ -338,3 +338,85 @@ func TestReadinessWhenJournalFull(t *testing.T) {
 		t.Fatal("full journal must be not ready")
 	}
 }
+
+// Regression: one event can match several hundred previously ingested events.
+// The incident count must be checked before persisting the new input, so
+// restarts cannot replay a ledger that exceeds its configured memory budget.
+func TestIncidentFanoutLimitIsAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.jsonl")
+	en, err := Open(path, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shell, conn := testEvents()
+	mustIngest(t, en, shell)
+	for i := 0; i < 10; i++ {
+		c := conn
+		c.ID = fmt.Sprintf("conn-%d", i)
+		mustIngest(t, en, c)
+	}
+	// All 10 accepted events create an incident. A further event is still
+	// admitted because the incident budget is 12.
+	conn.ID = "conn-eleven"
+	mustIngest(t, en, conn)
+	if en.Stats().Incidents != 11 {
+		t.Fatal(en.Stats())
+	}
+	// Remaining event capacity is exhausted; no event or incident is written.
+	conn.ID = "rejected-connection"
+	if _, err := en.Ingest(conn); !errors.Is(err, ErrFull) {
+		t.Fatalf("want capacity failure: %v", err)
+	}
+	if err := en.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.Stats().Events != 12 || reopened.Stats().Incidents != 11 {
+		t.Fatal(reopened.Stats())
+	}
+}
+
+// A delayed shell may fan out to more matching connections than the incident
+// budget even while the event budget still has space. Verify no partial write.
+func TestDelayedShellFanoutCapacity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.jsonl")
+	en, err := Open(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shell, conn := testEvents()
+	// Generate a second family of shell events that matches the same incoming
+	// connection. The third connection is rejected once the incident limit hits.
+	for i := 0; i < 8; i++ {
+		sh := shell
+		sh.ID = fmt.Sprintf("shell-%d", i)
+		mustIngest(t, en, sh)
+	}
+	conn.ID = "conn-first"
+	mustIngest(t, en, conn)
+	if en.Stats().Incidents != 8 {
+		t.Fatal(en.Stats())
+	}
+	conn.ID = "conn-second"
+	if _, err := en.Ingest(conn); !errors.Is(err, ErrFull) {
+		t.Fatalf("wanted fanout rejection, got %v", err)
+	}
+	if en.Stats().Events != 9 || en.Stats().Incidents != 8 {
+		t.Fatal(en.Stats())
+	}
+	if err := en.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if r.Stats().Events != 9 || r.Stats().Incidents != 8 {
+		t.Fatal(r.Stats())
+	}
+}

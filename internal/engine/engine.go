@@ -42,17 +42,18 @@ type Engine struct {
 }
 
 type Stats struct {
-	Events          int `json:"events"`
-	Incidents       int `json:"incidents"`
-	DryRunResponses int `json:"dry_run_responses"`
-	Capacity        int `json:"event_capacity"`
+	Events           int `json:"events"`
+	Incidents        int `json:"incidents"`
+	DryRunResponses  int `json:"dry_run_responses"`
+	Capacity         int `json:"event_capacity"`
+	IncidentCapacity int `json:"incident_capacity"`
 }
 
 func Open(path string, maxEvents int) (*Engine, error) {
 	if maxEvents < 1 {
 		maxEvents = DefaultMaxEvents
 	}
-	ledger, entries, err := journal.Open(path)
+	ledger, entries, err := journal.Open(path, maxEvents*2)
 	if err != nil {
 		return nil, err
 	}
@@ -64,6 +65,10 @@ func Open(path string, maxEvents int) (*Engine, error) {
 			if err := entry.Event.Validate(); err != nil {
 				ledger.Close()
 				return nil, fmt.Errorf("invalid replay event %d: %w", i, err)
+			}
+			if en.incidentBudgetExceeded(*entry.Event) {
+				ledger.Close()
+				return nil, fmt.Errorf("replay incident capacity exceeded at event %d", i)
 			}
 			if _, err := en.applyEvent(*entry.Event); err != nil {
 				ledger.Close()
@@ -95,7 +100,7 @@ func (en *Engine) Close() error { en.mu.Lock(); defer en.mu.Unlock(); return en.
 func (en *Engine) Ready() bool {
 	en.mu.RLock()
 	defer en.mu.RUnlock()
-	return en.ledger.Healthy() && en.totalEvents < en.maxEvents && len(en.responseRequests) < en.maxEvents
+	return en.ledger.Healthy() && en.totalEvents < en.maxEvents && len(en.responseRequests) < en.maxEvents && len(en.incidents) < en.maxEvents
 }
 
 func digest(e model.Event) [32]byte { b, _ := json.Marshal(e); return sha256.Sum256(b) }
@@ -115,7 +120,7 @@ func (en *Engine) Ingest(e model.Event) (created bool, err error) {
 		}
 		return false, nil
 	}
-	if en.totalEvents >= en.maxEvents {
+	if en.totalEvents >= en.maxEvents || en.incidentBudgetExceeded(e) {
 		return false, ErrFull
 	}
 	if err := en.ledger.Append(journal.Entry{Kind: "event", Event: &e}); err != nil {
@@ -123,6 +128,57 @@ func (en *Engine) Ingest(e model.Event) (created bool, err error) {
 	}
 	_, err = en.applyEvent(e)
 	return err == nil, err
+}
+
+// incidentBudgetExceeded preflights fan-out BEFORE the journal append. This
+// prevents a valid event from creating quadratic, unbounded in-memory incidents
+// and ensures a full ledger can be replayed deterministically. It must be
+// called with the engine lock held.
+func (en *Engine) incidentBudgetExceeded(e model.Event) bool {
+	st := en.scopes[e.Scope()]
+	if st == nil {
+		return false
+	}
+	remaining := en.maxEvents - len(en.incidents)
+	if remaining < 0 {
+		return true
+	}
+	count := 0
+	candidate := func(shell, conn model.Event) {
+		if count > remaining {
+			return
+		}
+		dt := conn.OccurredAt.Sub(shell.OccurredAt)
+		if dt < 0 || dt > model.Window {
+			return
+		}
+		if conn.Process.EntityID != shell.Process.EntityID && conn.Process.ParentEntityID != shell.Process.EntityID {
+			return
+		}
+		sum := sha256.Sum256([]byte(model.RuleShellEgress + "\x00" + shell.ID + "\x00" + conn.ID))
+		id := hex.EncodeToString(sum[:16])
+		if _, exists := en.incidents[id]; !exists {
+			count++
+		}
+	}
+	if e.Type == model.EventProcessExec && model.IsShell(e.Process.Executable) {
+		for _, conn := range st.connections[e.Process.EntityID] {
+			candidate(e, conn.e)
+		}
+		for _, conn := range st.childConnections[e.Process.EntityID] {
+			candidate(e, conn.e)
+		}
+	} else if e.Type == model.EventNetworkConnect && e.Network != nil && model.ExternalIP(e.Network.DestinationIP) {
+		for _, shell := range st.shells[e.Process.EntityID] {
+			candidate(shell.e, e)
+		}
+		if e.Process.ParentEntityID != "" {
+			for _, shell := range st.shells[e.Process.ParentEntityID] {
+				candidate(shell.e, e)
+			}
+		}
+	}
+	return count > remaining
 }
 
 func (en *Engine) applyEvent(e model.Event) (bool, error) {
@@ -243,7 +299,7 @@ func (en *Engine) Get(id string) (model.Incident, bool) {
 func (en *Engine) Stats() Stats {
 	en.mu.RLock()
 	defer en.mu.RUnlock()
-	return Stats{Events: en.totalEvents, Incidents: len(en.incidents), DryRunResponses: len(en.responseRequests), Capacity: en.maxEvents}
+	return Stats{Events: en.totalEvents, Incidents: len(en.incidents), DryRunResponses: len(en.responseRequests), Capacity: en.maxEvents, IncidentCapacity: en.maxEvents}
 }
 
 // DryRunResponse writes an audited *proposal*. No operating-system, container,

@@ -154,3 +154,32 @@ func TestResponseCannotSetMode(t *testing.T) {
 		t.Fatalf("accepted enforcement request: %d", w.Code)
 	}
 }
+
+func TestSeparatedCredentialsAndNoAnonymousFallback(t *testing.T) {
+	en, err := engine.Open(filepath.Join(t.TempDir(), "j"), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer en.Close()
+	h := (&API{Engine: en, IngestToken: "ingest-secret-00000000000000", AdminToken: "admin-secret-000000000000000"}).Handler()
+	e, _ := apiEvents()
+	if w := request(t, h, "POST", "/v1/events", encode(t, e), "admin-secret-000000000000000"); w.Code != 401 {
+		t.Fatalf("admin credential wrote events: %d", w.Code)
+	}
+	if w := request(t, h, "POST", "/v1/events", encode(t, e), "ingest-secret-00000000000000"); w.Code != 202 {
+		t.Fatalf("ingest rejected: %d %s", w.Code, w.Body.String())
+	}
+	if w := request(t, h, "GET", "/v1/incidents", nil, "ingest-secret-00000000000000"); w.Code != 401 {
+		t.Fatalf("collector read incidents: %d", w.Code)
+	}
+	if w := request(t, h, "GET", "/v1/incidents", nil, "admin-secret-000000000000000"); w.Code != 200 {
+		t.Fatalf("admin rejected: %d", w.Code)
+	}
+	if w := request(t, h, "GET", "/readyz", nil, ""); w.Code != 200 {
+		t.Fatalf("probe rejected: %d", w.Code)
+	}
+	h = (&API{Engine: en, IngestToken: "ingest-secret-00000000000000"}).Handler()
+	if w := request(t, h, "GET", "/v1/stats", nil, ""); w.Code != 401 {
+		t.Fatalf("missing admin role became anonymous: %d", w.Code)
+	}
+}
