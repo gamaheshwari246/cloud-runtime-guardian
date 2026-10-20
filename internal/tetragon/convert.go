@@ -24,6 +24,7 @@ type process struct {
 	Pod          *struct {
 		Namespace string `json:"namespace"`
 		Name      string `json:"name"`
+		UID       string `json:"uid"`
 		Container *struct {
 			ID string `json:"id"`
 		} `json:"container"`
@@ -107,6 +108,7 @@ func Convert(raw []byte, nodeName, bootID, fileID string, offset int64) (model.E
 		e.Workload.ID = hash("container", p.Pod.Container.ID)
 		e.Workload.Namespace = p.Pod.Namespace
 		e.Workload.Pod = p.Pod.Name
+		e.Workload.PodUID = p.Pod.UID
 		e.Workload.ContainerID = p.Pod.Container.ID
 	case p.Docker != "":
 		e.Workload.ID = hash("container", p.Docker)

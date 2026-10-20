@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"cloudruntimeguardian/internal/engine"
+	"cloudruntimeguardian/internal/identity"
 	"cloudruntimeguardian/internal/model"
 )
 
@@ -20,9 +21,10 @@ const maxRequestBytes = 32 << 10
 
 type API struct {
 	Engine      *engine.Engine
-	Token       string // backward-compatible single-token development mode
-	IngestToken string // collector-only credential; never grants incident read access
-	AdminToken  string // analyst/read-response credential; never grants event writes
+	Token       string             // backward-compatible single-token development mode
+	IngestToken string             // collector-only credential; never grants incident read access
+	AdminToken  string             // analyst/read-response credential; never grants event writes
+	Identity    *identity.Verifier // when set, node credentials and live pod checks are mandatory
 }
 
 func (api *API) Handler() http.Handler {
@@ -56,7 +58,7 @@ func (api *API) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+		if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && !(r.URL.Path == "/v1/events" && api.Identity != nil) {
 			wanted := api.AdminToken
 			if r.URL.Path == "/v1/events" {
 				wanted = api.IngestToken
@@ -117,6 +119,18 @@ func (api *API) events(w http.ResponseWriter, r *http.Request) {
 	if err := decode(w, r, &e); err != nil {
 		problem(w, decodeStatus(err), err.Error())
 		return
+	}
+	if api.Identity != nil {
+		verified, err := api.Identity.Verify(r.Context(), r.Header.Get("Authorization"), e)
+		if err != nil {
+			status := identity.StatusCode(err)
+			if status == http.StatusServiceUnavailable {
+				w.Header().Set("Retry-After", "2")
+			}
+			problem(w, status, "event source or workload identity could not be verified")
+			return
+		}
+		e = verified
 	}
 	created, err := api.Engine.Ingest(e)
 	if err != nil {

@@ -24,6 +24,7 @@ type Workload struct {
 	ID          string `json:"id"`
 	Namespace   string `json:"namespace,omitempty"`
 	Pod         string `json:"pod,omitempty"`
+	PodUID      string `json:"pod_uid,omitempty"`
 	ContainerID string `json:"container_id,omitempty"`
 }
 
@@ -73,7 +74,7 @@ func (e Event) Validate() error {
 	if e.OccurredAt.IsZero() {
 		return errors.New("occurred_at is required")
 	}
-	if len(e.Workload.Namespace) > 128 || len(e.Workload.Pod) > 128 || len(e.Workload.ContainerID) > 256 {
+	if len(e.Workload.Namespace) > 128 || len(e.Workload.Pod) > 128 || len(e.Workload.ContainerID) > 256 || len(e.Workload.PodUID) > 128 {
 		return errors.New("workload metadata exceeds maximum length")
 	}
 	if len(e.Process.Executable) > 4096 {

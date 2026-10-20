@@ -15,6 +15,7 @@ import (
 
 	"cloudruntimeguardian/internal/engine"
 	"cloudruntimeguardian/internal/httpapi"
+	"cloudruntimeguardian/internal/identity"
 )
 
 func main() {
@@ -39,11 +40,15 @@ func main() {
 			log.Fatal("API credentials must be at least 24 characters")
 		}
 	}
-	if (ingest != "" || admin != "") && (ingest == "" || admin == "" || ingest == admin) {
+	strict := os.Getenv("CRG_K8S_VERIFY") == "1"
+	if strict && (admin == "" || ingest != "" || legacy != "") {
+		log.Fatal("strict Kubernetes mode requires only CRG_ADMIN_TOKEN; collector credentials come from CRG_NODE_CREDENTIALS_FILE")
+	}
+	if !strict && (ingest != "" || admin != "") && (ingest == "" || admin == "" || ingest == admin) {
 		log.Fatal("CRG_INGEST_TOKEN and CRG_ADMIN_TOKEN must be distinct and both configured")
 	}
 	if !local {
-		if ingest == "" || admin == "" || ingest == admin {
+		if admin == "" || (!strict && (ingest == "" || ingest == admin)) {
 			log.Fatal("non-loopback listener needs distinct CRG_INGEST_TOKEN and CRG_ADMIN_TOKEN")
 		}
 		if *tlsCert == "" || *tlsKey == "" {
@@ -56,6 +61,30 @@ func main() {
 	if *maxEvents < 1 || *maxEvents > 1_000_000 {
 		log.Fatal("-max-events must be between 1 and 1000000")
 	}
+	var verifier *identity.Verifier
+	if strict {
+		if local || *tlsCert == "" {
+			log.Fatal("strict Kubernetes identity mode requires non-loopback HTTPS")
+		}
+		credentialsFile := os.Getenv("CRG_NODE_CREDENTIALS_FILE")
+		if credentialsFile == "" {
+			log.Fatal("CRG_NODE_CREDENTIALS_FILE is required")
+		}
+		credentials, err := identity.LoadCredentials(credentialsFile)
+		if err != nil {
+			log.Fatalf("load node credentials: %v", err)
+		}
+		client, err := identity.NewInClusterClient()
+		if err != nil {
+			log.Fatalf("initialize Kubernetes identity client: %v", err)
+		}
+		verifier, err = identity.New(client, credentials)
+		if err != nil {
+			log.Fatalf("initialize identity verifier: %v", err)
+		}
+	} else if os.Getenv("CRG_K8S_VERIFY") != "" && os.Getenv("CRG_K8S_VERIFY") != "0" {
+		log.Fatal("CRG_K8S_VERIFY must be 0 or 1")
+	}
 	en, err := engine.Open(*data, *maxEvents)
 	if err != nil {
 		log.Fatalf("open journal: %v", err)
@@ -63,7 +92,7 @@ func main() {
 	defer en.Close()
 
 	srv := &http.Server{
-		Addr: *addr, Handler: (&httpapi.API{Engine: en, Token: legacy, IngestToken: ingest, AdminToken: admin}).Handler(),
+		Addr: *addr, Handler: (&httpapi.API{Engine: en, Token: legacy, IngestToken: ingest, AdminToken: admin, Identity: verifier}).Handler(),
 		ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
 		MaxHeaderBytes: 1 << 16,

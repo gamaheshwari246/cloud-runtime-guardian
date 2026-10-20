@@ -40,9 +40,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err = collector.Run(ctx, collector.Config{ExportPath: *export, CheckpointPath: *checkpoint, NodeName: *node, BootID: boot, Follow: *follow, PollInterval: time.Second},
-		collector.HTTPSender{URL: *endpoint, Token: os.Getenv("CRG_API_TOKEN")})
+		collector.HTTPSender{URL: *endpoint, Token: collectorToken()})
 	if err != nil && err != context.Canceled {
 		fmt.Fprintln(os.Stderr, "collector stopped:", err)
 		os.Exit(1)
 	}
+}
+
+func collectorToken() string {
+	if t := os.Getenv("CRG_NODE_TOKEN"); t != "" {
+		return t
+	}
+	return os.Getenv("CRG_API_TOKEN")
 }
