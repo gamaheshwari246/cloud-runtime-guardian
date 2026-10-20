@@ -34,35 +34,40 @@ type scopeState struct {
 }
 
 type Engine struct {
-	mu               sync.RWMutex
-	ledger           *journal.Journal
-	maxEvents        int
-	events           map[string][32]byte
-	responseRequests map[string]model.ResponseAction
-	scopes           map[string]*scopeState
-	incidents        map[string]*model.Incident
-	incidentOrder    *incidentindex.Index
-	totalEvents      int
+	mu                 sync.RWMutex
+	ledger             *journal.Journal
+	maxEvents          int
+	events             map[string][32]byte
+	responseRequests   map[string]model.ResponseAction
+	containments       map[string]model.Containment
+	containmentRecords int
+	scopes             map[string]*scopeState
+	incidents          map[string]*model.Incident
+	incidentOrder      *incidentindex.Index
+	totalEvents        int
 }
 
 type Stats struct {
-	Events           int `json:"events"`
-	Incidents        int `json:"incidents"`
-	DryRunResponses  int `json:"dry_run_responses"`
-	Capacity         int `json:"event_capacity"`
-	IncidentCapacity int `json:"incident_capacity"`
+	Events              int `json:"events"`
+	Incidents           int `json:"incidents"`
+	DryRunResponses     int `json:"dry_run_responses"`
+	Capacity            int `json:"event_capacity"`
+	IncidentCapacity    int `json:"incident_capacity"`
+	Containments        int `json:"containments"`
+	PendingContainments int `json:"pending_containments"`
+	ContainmentRecords  int `json:"containment_records"`
 }
 
 func Open(path string, maxEvents int) (*Engine, error) {
 	if maxEvents < 1 {
 		maxEvents = DefaultMaxEvents
 	}
-	ledger, entries, err := journal.Open(path, maxEvents*2)
+	ledger, entries, err := journal.Open(path, maxEvents*6)
 	if err != nil {
 		return nil, err
 	}
 	en := &Engine{ledger: ledger, maxEvents: maxEvents,
-		events: make(map[string][32]byte), responseRequests: make(map[string]model.ResponseAction),
+		events: make(map[string][32]byte), responseRequests: make(map[string]model.ResponseAction), containments: make(map[string]model.Containment),
 		scopes: make(map[string]*scopeState), incidents: make(map[string]*model.Incident),
 		incidentOrder: &incidentindex.Index{}}
 	for i, entry := range entries {
@@ -79,6 +84,11 @@ func Open(path string, maxEvents int) (*Engine, error) {
 				ledger.Close()
 				return nil, fmt.Errorf("replay event %d: %w", i, err)
 			}
+		} else if entry.Kind == "containment" {
+			if err := en.applyContainment(*entry.Containment); err != nil {
+				ledger.Close()
+				return nil, fmt.Errorf("invalid replay containment %d: %w", i, err)
+			}
 		} else {
 			if err := entry.Response.Validate(); err != nil || entry.Response.Mode != "dry_run" || entry.Response.EnforcementApplied || entry.Response.RequestedAt.IsZero() {
 				ledger.Close()
@@ -91,7 +101,7 @@ func Open(path string, maxEvents int) (*Engine, error) {
 		}
 	}
 	// Replays are bounded too: opening an oversized ledger is explicit error.
-	if en.totalEvents > maxEvents || len(en.responseRequests) > maxEvents {
+	if en.totalEvents > maxEvents || len(en.responseRequests) > maxEvents || en.containmentRecords > maxEvents*4 {
 		ledger.Close()
 		return nil, fmt.Errorf("existing ledger exceeds configured capacity; increase max-events or archive")
 	}
@@ -105,7 +115,7 @@ func (en *Engine) Close() error { en.mu.Lock(); defer en.mu.Unlock(); return en.
 func (en *Engine) Ready() bool {
 	en.mu.RLock()
 	defer en.mu.RUnlock()
-	return en.ledger.Healthy() && en.totalEvents < en.maxEvents && len(en.responseRequests) < en.maxEvents && len(en.incidents) < en.maxEvents
+	return en.ledger.Healthy() && en.totalEvents < en.maxEvents && len(en.responseRequests) < en.maxEvents && len(en.incidents) < en.maxEvents && en.containmentRecords < en.maxEvents*4
 }
 
 func digest(e model.Event) [32]byte { b, _ := json.Marshal(e); return sha256.Sum256(b) }
@@ -353,7 +363,14 @@ func (en *Engine) Get(id string) (model.Incident, bool) {
 func (en *Engine) Stats() Stats {
 	en.mu.RLock()
 	defer en.mu.RUnlock()
-	return Stats{Events: en.totalEvents, Incidents: len(en.incidents), DryRunResponses: len(en.responseRequests), Capacity: en.maxEvents, IncidentCapacity: en.maxEvents}
+	pending := 0
+	for _, c := range en.containments {
+		if c.State != "released" {
+			pending++
+		}
+	}
+	return Stats{Events: en.totalEvents, Incidents: len(en.incidents), DryRunResponses: len(en.responseRequests), Capacity: en.maxEvents, IncidentCapacity: en.maxEvents,
+		Containments: len(en.containments), PendingContainments: pending, ContainmentRecords: en.containmentRecords}
 }
 
 // DryRunResponse writes an audited *proposal*. No operating-system, container,

@@ -113,6 +113,7 @@ type Pod struct {
 	Node         string
 	Deleting     bool
 	ContainerIDs []string
+	Labels       map[string]string
 }
 
 type boundSource struct {

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"cloudruntimeguardian/internal/containment"
 	"cloudruntimeguardian/internal/engine"
 	"cloudruntimeguardian/internal/httpapi"
 	"cloudruntimeguardian/internal/identity"
@@ -62,6 +63,7 @@ func main() {
 		log.Fatal("-max-events must be between 1 and 1000000")
 	}
 	var verifier *identity.Verifier
+	var verifierClient *identity.KubernetesClient
 	if strict {
 		if local || *tlsCert == "" {
 			log.Fatal("strict Kubernetes identity mode requires non-loopback HTTPS")
@@ -78,6 +80,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("initialize Kubernetes identity client: %v", err)
 		}
+		verifierClient = client
 		verifier, err = identity.New(client, credentials)
 		if err != nil {
 			log.Fatalf("initialize identity verifier: %v", err)
@@ -85,20 +88,60 @@ func main() {
 	} else if os.Getenv("CRG_K8S_VERIFY") != "" && os.Getenv("CRG_K8S_VERIFY") != "0" {
 		log.Fatal("CRG_K8S_VERIFY must be 0 or 1")
 	}
+	mode := os.Getenv("CRG_CONTAINMENT_MODE")
+	if mode != "" && mode != "simulate" && mode != "kubernetes" {
+		log.Fatal("CRG_CONTAINMENT_MODE must be empty, simulate or kubernetes")
+	}
+	if mode == "kubernetes" && !strict {
+		log.Fatal("Kubernetes containment requires strict node and workload identity verification")
+	}
+	if mode == "simulate" && !local {
+		log.Fatal("simulation mode is allowed only on loopback")
+	}
+	if mode != "" && admin == "" {
+		log.Fatal("containment requires a dedicated administrator credential")
+	}
+	stop, stopNotify := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopNotify()
 	en, err := engine.Open(*data, *maxEvents)
 	if err != nil {
 		log.Fatalf("open journal: %v", err)
 	}
 	defer en.Close()
+	// Never disable an active containment merely by changing configuration.
+	// Such a restart could leave external NetworkPolicies in place indefinitely.
+	for _, c := range en.ListContainments() {
+		if c.State != "released" && c.Mode != mode {
+			log.Fatal("unresolved containment requires its original backend mode until release")
+		}
+	}
+	// Reconciliation must stop before the single-writer ledger is closed.
+	workerCtx, stopWorker := context.WithCancel(stop)
+	var workerDone chan struct{}
+	if mode != "" {
+		var backend containment.Backend
+		if mode == "simulate" {
+			backend = &containment.Simulator{}
+		} else {
+			backend, err = containment.NewInClusterBackend(verifierClient)
+			if err != nil {
+				log.Fatalf("initialize Kubernetes containment backend: %v", err)
+			}
+		}
+		controller := &containment.Controller{Engine: en, Backend: backend, Mode: mode}
+		workerDone = make(chan struct{})
+		go func() {
+			defer close(workerDone)
+			controller.Run(workerCtx, 5*time.Second, func(err error) { log.Printf("containment reconciliation: %v", err) })
+		}()
+	}
 
 	srv := &http.Server{
-		Addr: *addr, Handler: (&httpapi.API{Engine: en, Token: legacy, IngestToken: ingest, AdminToken: admin, Identity: verifier}).Handler(),
+		Addr: *addr, Handler: (&httpapi.API{Engine: en, Token: legacy, IngestToken: ingest, AdminToken: admin, Identity: verifier, ContainmentMode: mode}).Handler(),
 		ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
 		MaxHeaderBytes: 1 << 16,
 	}
-	stop, stopNotify := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stopNotify()
 	go func() {
 		<-stop.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -108,14 +151,19 @@ func main() {
 		}
 	}()
 	srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	log.Printf("listening on %s (journal=%s, capacity=%d, authenticated=%t, tls=%t, enforcement=disabled)", *addr, *data, *maxEvents, legacy != "" || ingest != "" || admin != "", *tlsCert != "")
+	log.Printf("listening on %s (journal=%s, capacity=%d, authenticated=%t, tls=%t, containment-mode=%s)", *addr, *data, *maxEvents, legacy != "" || ingest != "" || admin != "", *tlsCert != "", mode)
 	var serveErr error
 	if *tlsCert != "" {
 		serveErr = srv.ListenAndServeTLS(*tlsCert, *tlsKey)
 	} else {
 		serveErr = srv.ListenAndServe()
 	}
+	stopWorker()
+	if workerDone != nil {
+		<-workerDone
+	}
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-		log.Fatal(serveErr)
+		log.Printf("server failed: %v", serveErr)
+		os.Exit(1)
 	}
 }

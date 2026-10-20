@@ -15,16 +15,18 @@ import (
 	"cloudruntimeguardian/internal/engine"
 	"cloudruntimeguardian/internal/identity"
 	"cloudruntimeguardian/internal/model"
+	"time"
 )
 
 const maxRequestBytes = 32 << 10
 
 type API struct {
-	Engine      *engine.Engine
-	Token       string             // backward-compatible single-token development mode
-	IngestToken string             // collector-only credential; never grants incident read access
-	AdminToken  string             // analyst/read-response credential; never grants event writes
-	Identity    *identity.Verifier // when set, node credentials and live pod checks are mandatory
+	Engine          *engine.Engine
+	Token           string             // backward-compatible single-token development mode
+	IngestToken     string             // collector-only credential; never grants incident read access
+	AdminToken      string             // analyst/read-response credential; never grants event writes
+	ContainmentMode string             // empty disables state changes; simulate/kubernetes require explicit operator opt-in
+	Identity        *identity.Verifier // when set, node credentials and live pod checks are mandatory
 }
 
 func (api *API) Handler() http.Handler {
@@ -44,6 +46,8 @@ func (api *API) Handler() http.Handler {
 		fmt.Fprintf(w, "# TYPE crg_incidents gauge\ncrg_incidents %d\n", s.Incidents)
 		fmt.Fprintf(w, "# TYPE crg_dry_run_responses gauge\ncrg_dry_run_responses %d\n", s.DryRunResponses)
 		fmt.Fprintf(w, "# TYPE crg_event_capacity gauge\ncrg_event_capacity %d\n", s.Capacity)
+		fmt.Fprintf(w, "# TYPE crg_containments gauge\ncrg_containments %d\n", s.Containments)
+		fmt.Fprintf(w, "# TYPE crg_pending_containments gauge\ncrg_pending_containments %d\n", s.PendingContainments)
 		ready := 0
 		if api.Engine.Ready() {
 			ready = 1
@@ -54,6 +58,10 @@ func (api *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/incidents", api.list)
 	mux.HandleFunc("GET /v1/incidents/{id}", api.get)
 	mux.HandleFunc("POST /v1/incidents/{id}/response", api.response)
+	mux.HandleFunc("POST /v1/incidents/{id}/containment", api.createContainment)
+	mux.HandleFunc("GET /v1/containments", api.listContainments)
+	mux.HandleFunc("GET /v1/containments/{id}", api.getContainment)
+	mux.HandleFunc("DELETE /v1/containments/{id}", api.releaseContainment)
 	mux.HandleFunc("GET /v1/stats", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, api.Engine.Stats()) })
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -243,4 +251,77 @@ func decodeStatus(err error) int {
 		return http.StatusRequestEntityTooLarge
 	}
 	return http.StatusBadRequest
+}
+
+func (api *API) createContainment(w http.ResponseWriter, r *http.Request) {
+	if api.ContainmentMode != "simulate" && api.ContainmentMode != "kubernetes" {
+		problem(w, 403, "containment is disabled by operator")
+		return
+	}
+	var req struct {
+		RequestID      string `json:"request_id"`
+		Reason         string `json:"reason"`
+		TTLSeconds     int    `json:"ttl_seconds"`
+		ConfirmPodWide bool   `json:"confirm_pod_wide"`
+	}
+	if err := decode(w, r, &req); err != nil {
+		problem(w, decodeStatus(err), err.Error())
+		return
+	}
+	if !req.ConfirmPodWide {
+		problem(w, 400, "confirm_pod_wide=true is required because this can isolate the whole pod")
+		return
+	}
+	if req.TTLSeconds < 60 || req.TTLSeconds > 3600 {
+		problem(w, 400, "ttl_seconds must be between 60 and 3600")
+		return
+	}
+	result, created, err := api.Engine.RequestContainment(req.RequestID, r.PathValue("id"), req.Reason, time.Duration(req.TTLSeconds)*time.Second, api.ContainmentMode, time.Now().UTC())
+	if err != nil {
+		switch {
+		case errors.Is(err, engine.ErrNotFound):
+			problem(w, 404, err.Error())
+		case errors.Is(err, engine.ErrConflict), errors.Is(err, engine.ErrActiveContainment):
+			problem(w, 409, err.Error())
+		case errors.Is(err, engine.ErrFull):
+			problem(w, 507, err.Error())
+		case errors.Is(err, engine.ErrUnsafeTarget):
+			problem(w, 422, err.Error())
+		default:
+			problem(w, 500, "containment request could not be recorded")
+		}
+		return
+	}
+	if !created {
+		writeJSON(w, 200, result)
+	} else {
+		writeJSON(w, 202, result)
+	}
+}
+func (api *API) listContainments(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"containments": api.Engine.ListContainments()})
+}
+func (api *API) getContainment(w http.ResponseWriter, r *http.Request) {
+	c, ok := api.Engine.GetContainment(r.PathValue("id"))
+	if !ok {
+		problem(w, 404, "containment not found")
+		return
+	}
+	writeJSON(w, 200, c)
+}
+func (api *API) releaseContainment(w http.ResponseWriter, r *http.Request) {
+	if api.ContainmentMode != "simulate" && api.ContainmentMode != "kubernetes" {
+		problem(w, 403, "containment is disabled by operator")
+		return
+	}
+	c, err := api.Engine.RequestRelease(r.PathValue("id"), time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, engine.ErrNotFound) {
+			problem(w, 404, err.Error())
+		} else {
+			problem(w, 500, "release request could not be durably recorded")
+		}
+		return
+	}
+	writeJSON(w, 202, c)
 }

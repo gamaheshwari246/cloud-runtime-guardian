@@ -106,7 +106,8 @@ func (c *KubernetesClient) LookupPod(ctx context.Context, namespace, name string
 	var p struct {
 		Metadata struct {
 			UID, Namespace, Name string
-			DeletionTimestamp    *time.Time `json:"deletionTimestamp"`
+			Labels               map[string]string `json:"labels"`
+			DeletionTimestamp    *time.Time        `json:"deletionTimestamp"`
 		} `json:"metadata"`
 		Spec struct {
 			NodeName string `json:"nodeName"`
@@ -126,7 +127,7 @@ func (c *KubernetesClient) LookupPod(ctx context.Context, namespace, name string
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return Pod{}, fmt.Errorf("%w: invalid Kubernetes response", ErrUnavailable)
 	}
-	result := Pod{UID: p.Metadata.UID, Namespace: p.Metadata.Namespace, Name: p.Metadata.Name, Node: p.Spec.NodeName, Deleting: p.Metadata.DeletionTimestamp != nil}
+	result := Pod{UID: p.Metadata.UID, Namespace: p.Metadata.Namespace, Name: p.Metadata.Name, Node: p.Spec.NodeName, Deleting: p.Metadata.DeletionTimestamp != nil, Labels: p.Metadata.Labels}
 	for _, lst := range [][]struct {
 		ContainerID string `json:"containerID"`
 	}{p.Status.ContainerStatuses, p.Status.InitContainerStatuses, p.Status.EphemeralContainerStatuses} {

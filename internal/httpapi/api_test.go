@@ -235,3 +235,48 @@ func TestCursorPaginationHTTP(t *testing.T) {
 		}
 	}
 }
+
+func TestContainmentRequiresAdminAndExplicitOperatorMode(t *testing.T) {
+	en, err := engine.Open(filepath.Join(t.TempDir(), "ledger.jsonl"), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer en.Close()
+	sh, conn := apiEvents()
+	sh.Workload = model.Workload{ID: "verified-workload", Namespace: "prod", Pod: "payments", PodUID: "pod-uid", ContainerID: "containerd://xyz"}
+	conn.Workload = sh.Workload
+	for _, e := range []model.Event{sh, conn} {
+		if _, err := en.Ingest(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	incidents, _ := en.List(1, 0)
+	id := incidents[0].ID
+	admin := "an-administrator-credential-12345678"
+	ingest := "a-collector-credential-12345678"
+	disabled := (&API{Engine: en, AdminToken: admin, IngestToken: ingest}).Handler()
+	endpoint := "/v1/incidents/" + id + "/containment"
+	body := []byte(`{"request_id":"req-100","ttl_seconds":60,"reason":"Operator approved manual test","confirm_pod_wide":true}`)
+	if w := request(t, disabled, "POST", endpoint, body, admin); w.Code != 403 {
+		t.Fatalf("disabled endpoint %d", w.Code)
+	}
+	enabled := (&API{Engine: en, AdminToken: admin, IngestToken: ingest, ContainmentMode: "simulate"}).Handler()
+	if w := request(t, enabled, "POST", endpoint, body, ingest); w.Code != 401 {
+		t.Fatalf("collector used admin endpoint: %d", w.Code)
+	}
+	if w := request(t, enabled, "POST", endpoint, []byte(`{"request_id":"req-100","ttl_seconds":60,"reason":"Operator approved manual test"}`), admin); w.Code != 400 {
+		t.Fatalf("missing consent %d", w.Code)
+	}
+	if w := request(t, enabled, "POST", endpoint, body, admin); w.Code != 202 || !strings.Contains(w.Body.String(), `"state":"requested"`) {
+		t.Fatalf("containment request %d %s", w.Code, w.Body.String())
+	}
+	if w := request(t, enabled, "POST", endpoint, body, admin); w.Code != 200 {
+		t.Fatalf("idempotent retry %d", w.Code)
+	}
+	if w := request(t, enabled, "GET", "/v1/containments/req-100", nil, ingest); w.Code != 401 {
+		t.Fatalf("collector read incident response %d", w.Code)
+	}
+	if w := request(t, enabled, "DELETE", "/v1/containments/req-100", nil, admin); w.Code != 202 {
+		t.Fatalf("manual release %d %s", w.Code, w.Body.String())
+	}
+}

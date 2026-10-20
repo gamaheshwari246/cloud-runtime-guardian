@@ -1,0 +1,63 @@
+# OPTIONAL fallback cleanup: separate identity from the API server.
+# Replace namespace and published image digest before applying.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crg-containment-sweeper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: crg-containment-sweeper
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [list, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: crg-containment-sweeper
+subjects:
+  - kind: ServiceAccount
+    name: crg-containment-sweeper
+    namespace: REPLACE_WITH_NAMESPACE
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: crg-containment-sweeper
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: crg-containment-sweeper
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 45
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 120
+      template:
+        spec:
+          serviceAccountName: crg-containment-sweeper
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: sweeper
+              image: ghcr.io/REPLACE_WITH_OWNER/cloud-runtime-guardian@sha256:REPLACE_WITH_IMAGE_DIGEST
+              command: ["/usr/local/bin/crg-containment-sweeper"]
+              resources:
+                requests: {cpu: 20m, memory: 32Mi}
+                limits: {cpu: "250m", memory: 128Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}

@@ -25,10 +25,11 @@ const (
 var ErrLocked = errors.New("journal already has a writer")
 
 type Entry struct {
-	Version  int                   `json:"version"`
-	Kind     string                `json:"kind"`
-	Event    *model.Event          `json:"event,omitempty"`
-	Response *model.ResponseAction `json:"response,omitempty"`
+	Version     int                   `json:"version"`
+	Kind        string                `json:"kind"`
+	Event       *model.Event          `json:"event,omitempty"`
+	Response    *model.ResponseAction `json:"response,omitempty"`
+	Containment *model.Containment    `json:"containment,omitempty"`
 }
 
 type Journal struct {
@@ -149,9 +150,10 @@ func validateRecord(line []byte) (Entry, error) {
 	if err := dec.Decode(&trailing); err != io.EOF {
 		return e, errors.New("unexpected trailing JSON or garbage")
 	}
-	if e.Version != 1 || (e.Kind != "event" && e.Kind != "response") ||
-		(e.Kind == "event" && (e.Event == nil || e.Response != nil)) ||
-		(e.Kind == "response" && (e.Response == nil || e.Event != nil)) {
+	if e.Version != 1 || (e.Kind != "event" && e.Kind != "response" && e.Kind != "containment") ||
+		(e.Kind == "event" && (e.Event == nil || e.Response != nil || e.Containment != nil)) ||
+		(e.Kind == "response" && (e.Response == nil || e.Event != nil || e.Containment != nil)) ||
+		(e.Kind == "containment" && (e.Containment == nil || e.Event != nil || e.Response != nil)) {
 		return e, errors.New("unsupported journal record")
 	}
 	return e, nil
