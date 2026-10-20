@@ -101,8 +101,8 @@ func TestFailClosedOnCorruptionAndIdentityChange(t *testing.T) {
 			t.Fatal(err)
 		}
 		write(t, path, testExec+"\n")
-		if err := Run(context.Background(), cfg, sender); err == nil {
-			t.Fatal("expected inode mismatch")
+		if err := Run(context.Background(), cfg, sender); err != nil {
+			t.Fatalf("rename/create rotation should recover when old inode retained: %v", err)
 		}
 	})
 }

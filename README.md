@@ -104,3 +104,17 @@ observability/alerting, and real containment remain unimplemented. The
 checkpoint is on the same local disk; operators must supervise and retain
 export logs until ingestion is confirmed. The fail-closed approach prioritizes
 correctness over availability.
+
+## Reliability and operations (development)
+
+The collector now supports **single, unambiguous rename/create rotation**, including
+restart recovery from a retained archive. It refuses missing or multiple archives,
+incomplete rotated records and `copytruncate`; it does not silently jump over
+unprocessed intermediate files. `ArchiveGlob` defaults to `export + ".*"`; archives
+must be kept until acknowledged. Multi-rotation durability requires a real
+rotation manifest or streaming cursor and remains a **production blocker**.
+
+The service provides unauthenticated `GET /healthz` (process liveness) and
+`GET /readyz` (ledger writable and below capacity). `GET /metrics` emits
+Prometheus-compatible gauges and uses normal API bearer-token protection.
+Read the [cluster readiness runbook](docs/cluster-readiness.md) before deploying.

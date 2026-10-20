@@ -90,6 +90,14 @@ func Open(path string, maxEvents int) (*Engine, error) {
 
 func (en *Engine) Close() error { en.mu.Lock(); defer en.mu.Unlock(); return en.ledger.Close() }
 
+// Ready is an admission/availability signal. An unhealthy ledger or exhausted
+// event/response capacity requires operator action before further ingestion.
+func (en *Engine) Ready() bool {
+	en.mu.RLock()
+	defer en.mu.RUnlock()
+	return en.ledger.Healthy() && en.totalEvents < en.maxEvents && len(en.responseRequests) < en.maxEvents
+}
+
 func digest(e model.Event) [32]byte { b, _ := json.Marshal(e); return sha256.Sum256(b) }
 
 // Ingest returns created=false for an exact event retry. A reused event id with

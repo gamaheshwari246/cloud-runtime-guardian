@@ -1,5 +1,5 @@
-// Package collector forwards one append-only JSONL export with crash-safe
-// checkpoints. Rotation or truncation fails closed until an operator intervenes.
+// Package collector forwards a Tetragon JSONL export with crash-safe checkpoints.
+// Rename-based rotation can be resumed if the old file is still retained.
 package collector
 
 import (
@@ -13,12 +13,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
-
-	"cloudruntimeguardian/internal/tetragon"
 )
 
 const maxLine = 256 << 10
@@ -157,13 +154,17 @@ func (s HTTPSender) Send(ctx context.Context, b []byte) error {
 
 type Config struct {
 	ExportPath, CheckpointPath, NodeName, BootID string
-	Follow                                       bool
-	PollInterval                                 time.Duration
+	// ArchiveGlob is used only to locate the checkpointed file after a
+	// rename-based rotation. The default is ExportPath + ".*".
+	ArchiveGlob  string
+	Follow       bool
+	PollInterval time.Duration
 }
 
 // Run never acknowledges a record until the API has acknowledged its durable
 // append. It checkpoints skipped unrelated events, but never malformed target
-// events. The input file must not rotate or truncate; both cause an error.
+// events. Rename-based rotation is recoverable if retained exports remain
+// accessible; copytruncate and missing archives fail closed.
 func nextLine(r *bufio.Reader) ([]byte, error) {
 	var line []byte
 	for {
@@ -176,108 +177,6 @@ func nextLine(r *bufio.Reader) ([]byte, error) {
 			continue
 		}
 		return line, err
-	}
-}
-
-func Run(ctx context.Context, cfg Config, sender Sender) error {
-	if cfg.ExportPath == "" || cfg.CheckpointPath == "" || cfg.NodeName == "" || cfg.BootID == "" {
-		return errors.New("export, checkpoint, node name and boot ID are required")
-	}
-	if cfg.PollInterval <= 0 {
-		cfg.PollInterval = time.Second
-	}
-	f, err := os.Open(cfg.ExportPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	current, err := identity(fi)
-	if err != nil {
-		return err
-	}
-	cp, exists, err := load(cfg.CheckpointPath)
-	if err != nil {
-		return err
-	}
-	if exists {
-		if cp.NodeName != cfg.NodeName || cp.BootID != cfg.BootID {
-			return errors.New("source node or boot changed; refusing to misattribute replay")
-		}
-		if cp.Device != current.Device || cp.Inode != current.Inode {
-			return errors.New("export identity changed since checkpoint; refusing to skip or replay without operator action")
-		}
-		current.Offset = cp.Offset
-	}
-	current.NodeName, current.BootID = cfg.NodeName, cfg.BootID
-	if fi.Size() < current.Offset {
-		return errors.New("export truncated below checkpoint; refusing to skip data")
-	}
-	if _, err := f.Seek(current.Offset, io.SeekStart); err != nil {
-		return err
-	}
-	reader := bufio.NewReaderSize(f, 32<<10)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		line, err := nextLine(reader)
-		if errors.Is(err, io.EOF) {
-			// A partial line is not committed; seek back before polling.
-			if _, err := f.Seek(current.Offset, io.SeekStart); err != nil {
-				return err
-			}
-			reader.Reset(f)
-			if !cfg.Follow {
-				return nil
-			}
-			pathFi, statErr := os.Stat(cfg.ExportPath)
-			if statErr != nil {
-				return fmt.Errorf("export path changed: %w", statErr)
-			}
-			newID, statErr := identity(pathFi)
-			if statErr != nil {
-				return statErr
-			}
-			if newID.Inode != current.Inode || newID.Device != current.Device || pathFi.Size() < current.Offset {
-				return errors.New("export rotated or truncated; input requires operator recovery")
-			}
-			timer := time.NewTimer(cfg.PollInterval)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		if len(line) > maxLine {
-			return fmt.Errorf("oversized export line at offset %d", current.Offset)
-		}
-		raw := bytes.TrimSpace(line)
-		event, err := tetragon.Convert(raw, cfg.NodeName, cfg.BootID, strconv.FormatUint(current.Device, 10)+":"+strconv.FormatUint(current.Inode, 10), current.Offset)
-		if err != nil && !errors.Is(err, tetragon.ErrUnsupported) {
-			return fmt.Errorf("export offset %d: %w", current.Offset, err)
-		}
-		if err == nil {
-			b, marshalErr := json.Marshal(event)
-			if marshalErr != nil {
-				return marshalErr
-			}
-			if err := sender.Send(ctx, b); err != nil {
-				return fmt.Errorf("send at export offset %d: %w", current.Offset, err)
-			}
-		}
-		current.Offset += int64(len(line))
-		if err := save(cfg.CheckpointPath, current); err != nil {
-			return fmt.Errorf("checkpoint commit: %w", err)
-		}
 	}
 }
 

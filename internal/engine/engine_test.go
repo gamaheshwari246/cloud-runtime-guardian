@@ -320,3 +320,21 @@ func TestDryRunResponseCapacityAndReplay(t *testing.T) {
 		t.Fatalf("responses lost on restart: %+v", stats)
 	}
 }
+
+func TestReadinessWhenJournalFull(t *testing.T) {
+	en, err := Open(filepath.Join(t.TempDir(), "journal.jsonl"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer en.Close()
+	if !en.Ready() {
+		t.Fatal("empty journal must be ready")
+	}
+	e, _ := testEvents()
+	if _, err := en.Ingest(e); err != nil {
+		t.Fatal(err)
+	}
+	if en.Ready() {
+		t.Fatal("full journal must be not ready")
+	}
+}

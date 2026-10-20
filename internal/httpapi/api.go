@@ -25,6 +25,26 @@ type API struct {
 func (api *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !api.Engine.Ready() {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		s := api.Engine.Stats()
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		fmt.Fprintf(w, "# TYPE crg_events_stored gauge\ncrg_events_stored %d\n", s.Events)
+		fmt.Fprintf(w, "# TYPE crg_incidents gauge\ncrg_incidents %d\n", s.Incidents)
+		fmt.Fprintf(w, "# TYPE crg_dry_run_responses gauge\ncrg_dry_run_responses %d\n", s.DryRunResponses)
+		fmt.Fprintf(w, "# TYPE crg_event_capacity gauge\ncrg_event_capacity %d\n", s.Capacity)
+		ready := 0
+		if api.Engine.Ready() {
+			ready = 1
+		}
+		fmt.Fprintf(w, "# TYPE crg_ready gauge\ncrg_ready %d\n", ready)
+	})
 	mux.HandleFunc("POST /v1/events", api.events)
 	mux.HandleFunc("GET /v1/incidents", api.list)
 	mux.HandleFunc("GET /v1/incidents/{id}", api.get)
@@ -33,7 +53,7 @@ func (api *API) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		if r.URL.Path != "/healthz" && api.Token != "" {
+		if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && api.Token != "" {
 			supplied := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if len(supplied) != len(api.Token) || subtle.ConstantTimeCompare([]byte(supplied), []byte(api.Token)) != 1 {
 				w.Header().Set("WWW-Authenticate", "Bearer")

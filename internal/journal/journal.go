@@ -108,4 +108,8 @@ func (j *Journal) Append(e Entry) error {
 	return nil
 }
 
+// Healthy reports whether the last journal commit succeeded. The engine's
+// mutex must be held while reading it, just as for Append.
+func (j *Journal) Healthy() bool { return !j.failed }
+
 func (j *Journal) Close() error { return j.file.Close() }

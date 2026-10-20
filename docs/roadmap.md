@@ -52,3 +52,13 @@ Acceptance tests:
 - [ ] Benchmark kernel overhead in controlled environments and automate kernel compatibility CI.
 
 **Milestone rule:** No enforcement path should ship before identity integrity, bounded resource usage, auditability, and rollback tests are credible.
+
+## Reliability work (October 2026)
+
+- [x] Resume a single rename/create export rotation after collector restart.
+- [x] Reject ambiguous/missing archived records and incomplete rotated lines.
+- [x] Expose liveness, readiness, and basic capacity gauges.
+- [x] Test rotation, crash/restart, duplicated events and source corruption.
+- [ ] Validate actual sensor event payloads and rotate under continuous cluster load.
+- [ ] Add durable event sequence manifest or cursor-based streaming for multiple rotations.
+- [ ] Segment and index event ledger; eliminate fixed event-capacity exhaustion.
