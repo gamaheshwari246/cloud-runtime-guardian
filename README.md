@@ -59,7 +59,7 @@ The response always includes `"mode":"dry_run"` and `"enforcement_applied":false
 ## Security defaults
 
 - The server listens **only on 127.0.0.1** by default.
-- To listen on a non-loopback address, set `CRG_API_TOKEN` to a random secret of at least 24 characters and use TLS at a trusted reverse proxy. This example bearer token is **not** production identity/RBAC.
+- For a non-loopback listener, configure distinct `CRG_INGEST_TOKEN` and `CRG_ADMIN_TOKEN` (at least 24 characters each), provide `-tls-cert` and `-tls-key`, and restrict network access. `CRG_API_TOKEN` is retained only for older loopback development usage. These bearer tokens do not replace production identity/RBAC.
 - JSON input is size-limited (32 KiB), unknown properties are rejected, and event identifiers are validated.
 - Event IDs and response request IDs are idempotency keys and remain effective after restart. Reusing an ID with different content returns `409`.
 - Dry-run response recording cannot initiate a kill, firewall rule, cloud API call, or container action.
@@ -69,18 +69,18 @@ The response always includes `"mode":"dry_run"` and `"enforcement_applied":false
 
 ## Known limitations (intentional)
 
-1. **No live kernel instrumentation:** only normalized events are accepted. Next build: Linux exec/connect collector using an existing eBPF sensor or a standalone CO-RE probe, with reliable host/boot/process IDs.
+1. **No bundled kernel instrumentation:** the Tetragon JSONL collector ingests exported sensor events, but no eBPF sensor is bundled or validated on a live Linux/Kubernetes deployment. Linux boot identity, exported process IDs and workload labels still require live validation.
 2. **One behavioral rule:** shell execution followed by external egress within 5 minutes, from the same process or its *immediate* child. This is a heuristic; legitimate administration can trigger it.
 3. **External-IP heuristic:** globally unicast, non-private destinations can still include reserved ranges. Future rules must use versioned customer-specific egress policies and IP classification; do not block on this alone.
 4. **No deep process ancestry:** multi-generation descendants are not yet linked. Process ID includes an opaque stable entity ID supplied by the sensor; the engine does not validate how it was constructed.
 5. **Single-node journal:** 50,000 events by default, no compaction, segmentation, HA, replication, or log rotation. When full, new unique events receive HTTP 507. Read-heavy and high-rate use cases need an indexed, bounded storage engine.
-6. **Unbounded response count:** audit responses are durable, but this prototype does not cap their count. Do not expose it to untrusted automated callers.
+6. **Fixed response capacity:** audit responses are durable and capped at the configured journal event capacity. A full response ledger refuses new response proposals (HTTP 507); archival, retention and compaction are not implemented.
 7. **No policy enforcement, Kubernetes identity verification, or multi-tenant isolation.** The client-provided workload labels are not authenticated to a cluster API.
 8. **No comprehensive threat intelligence, malware scanning, kernel vulnerability handling, or guaranteed detection.** Events may be delayed or missing at their original source; the service cannot infer losses upstream.
 
 ## Next milestones
 
-See [`docs/roadmap.md`](docs/roadmap.md). The next priority is **a real Linux sensor with workload identity**, before expanding to microsegmentation, response, and fleet management.
+See [`docs/roadmap.md`](docs/roadmap.md). The next priority is **validation against real Tetragon events on Linux/Kubernetes**, then high-volume indexed storage, retention, and authenticated workload identity before fleet management or enforcement.
 
 ## Development
 
@@ -98,9 +98,9 @@ to remote IPs. See [Tetragon source notes](examples/tetragon/README.md).
 
 This is a **tested ingestion bridge, not production-ready EDR**. The exporter
 must be configured to emit connect events; host-node name and boot epoch must
-match. Automatic rotation recovery, HA event queues, policy-based filtering,
+match. Multi-file rotation recovery, HA event queues, policy-based filtering,
 large-volume indexing, authentication beyond one bearer token, complete
-observability/alerting, and real containment remain unimplemented. The
+full observability/alerting, and real containment remain unimplemented. The
 checkpoint is on the same local disk; operators must supervise and retain
 export logs until ingestion is confirmed. The fail-closed approach prioritizes
 correctness over availability.
