@@ -1,7 +1,7 @@
 name: Go tests
+# Automatic runs paused at owner's request; manual execution only.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 jobs:
   test:
     runs-on: ubuntu-latest
